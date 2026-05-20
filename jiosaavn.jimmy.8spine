@@ -1,0 +1,243 @@
+/* @8spine-meta
+ * type: MODULE
+ * category: music
+ * featured: false
+ * trusted: true
+ * nsfw: false
+ */
+
+const LOG_PREFIX = '[JioSaavn-JIMMY]';
+// Using the new Vercel deployment endpoint
+const API_BASE = 'https://saavnapi-nine.vercel.app'; 
+
+const REQUEST_HEADERS = {
+    'Accept': 'application/json',
+    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
+};
+
+// Reuse helpers from the original module
+function normalize(s) {
+    if (!s) return '';
+    let out = String(s).toLowerCase();
+    if (typeof out.normalize === 'function') out = out.normalize('NFKD').replace(/[\u0000-\u036f]/g, '');
+    return out.replace(/\([^)]*\)|\[[^\]]*\]/g, ' ').replace(/feat\.?|featuring|ft\.?|with\s+/gi, ' ').replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function similarity(a, b) {
+    a = normalize(a); b = normalize(b);
+    if (!a || !b) return 0;
+    if (a === b) return 1;
+    if (a.length < 2 || b.length < 2) return 0;
+    let bigrams = {};
+    for (let i = 0; i < a.length - 1; i++) {
+        let bg = a.substring(i, i + 2);
+        bigrams[bg] = (bigrams[bg] || 0) + 1;
+    }
+    let hits = 0;
+    for (let j = 0; j < b.length - 1; j++) {
+        let bg2 = b.substring(j, j + 2);
+        if (bigrams[bg2]) { bigrams[bg2]--; hits++; }
+    }
+    return (2 * hits) / (a.length + b.length - 2);
+}
+
+function queryRelevance(query, title, artist, album) {
+    if (!query) return 0;
+    const qTokens = normalize(query).split(' ').filter(t => t.length > 1);
+    if (!qTokens.length) return 0;
+    const hay = normalize((title || '') + ' ' + (artist || '') + ' ' + (album || ''));
+    let hits = 0;
+    for (let i = 0; i < qTokens.length; i++) if (hay.includes(qTokens[i])) hits++;
+    let base = hits / qTokens.length;
+    if (hits < qTokens.length) base = base * 0.3; 
+    if (similarity(query, normalize(artist || '')) > 0.80) base = Math.min(1.3, base + 0.30);
+    if (similarity(query, normalize(title || '')) > 0.80) base = Math.min(1.3, base + 0.30);
+    return base;
+}
+
+function canonicityScore(title) {
+    if (!title) return 1.0;
+    const t = String(title).toLowerCase();
+    let score = 1.0;
+    if (/\(live[^)]*\)|\[live[^\]]*\]|\blive\b/i.test(t)) score -= 0.40;
+    if (/\binstrumental\b|\bkaraoke\b/i.test(t)) score -= 0.50;
+    if (/\bcover\b/i.test(t)) score -= 0.35;
+    if (/\bslowed\b|\bsped[\s-]?up\b|\bnightcore\b|\breverb\b|\b8d\b/i.test(t)) score -= 0.70;
+    if (/\bremix\b|\bmix\b/i.test(t)) score -= 0.10;
+    if (!/\(.+\)|\s[-\u2013\u2014]\s/.test(t)) score += 0.20;
+    return Math.max(0.10, Math.min(score, 1.30));
+}
+
+function extractBestImage(imageObj) {
+    if (Array.isArray(imageObj) && imageObj.length > 0) return imageObj[imageObj.length - 1].url || imageObj[imageObj.length - 1].link || '';
+    if (typeof imageObj === 'string') return imageObj;
+    return '';
+}
+
+function mapTrack(song) {
+    const bestImage = extractBestImage(song.image || song.image_url || song.thumbnail || '');
+    let bestAudio = song.media_url || song.url || '';
+    if (Array.isArray(song.downloadUrl) && song.downloadUrl.length > 0) {
+        bestAudio = song.downloadUrl[song.downloadUrl.length - 1].url || song.downloadUrl[song.downloadUrl.length - 1].link || '';
+    }
+
+    let artistName = 'Unknown Artist';
+    let artistId = null;
+    if (song.primary_artists) {
+        artistName = song.primary_artists;
+    } else if (song.artists && Array.isArray(song.artists.primary) && song.artists.primary.length > 0) {
+        artistName = song.artists.primary.map(a => a.name).join(', ');
+        artistId = String(song.artists.primary[0].id || song.artists.primary[0].pid || '');
+    } else if (typeof song.primaryArtists === 'string') {
+        artistName = song.primaryArtists;
+    } else if (Array.isArray(song.primaryArtists)) {
+        artistName = song.primaryArtists.map(a => a.name).join(', ');
+        if (song.primaryArtists.length > 0) artistId = String(song.primaryArtists[0].id || song.primaryArtists[0].pid || '');
+    }
+
+    const title = song.song || song.name || song.title || 'Unknown Title';
+    const albumName = (song.album && song.album.name) ? song.album.name : (typeof song.album === 'string' ? song.album : 'Unknown Album');
+    const albumId = (song.album && (song.album.id || song.album.albumid)) ? String(song.album.id || song.album.albumid) : null;
+    const rawId = song.perma_url || song.id || song.songid || song.vcode || '';
+    const compoundId = String(rawId) + '||' + (bestAudio || '');
+
+    return {
+        id: compoundId,
+        title: title,
+        artist: artistName,
+        artistId: artistId,
+        album: albumName,
+        albumId: albumId,
+        albumCover: bestImage,
+        duration: parseInt(song.duration) || 0,
+        audioQuality: 'HIGH',
+        _playCount: parseInt(song.play_count) || parseInt(song.playCount) || 0,
+        // keep raw payload if needed
+        _raw: song
+    };
+}
+
+// JIMMY-enabled searchTracks: applies Jimmy scoring and dedupe by default
+async function searchTracks(query, limit = 20) {
+    try {
+        const response = await fetch(`${API_BASE}/result/?query=${encodeURIComponent(query)}&limit=${limit}`, { headers: REQUEST_HEADERS });
+        if (!response.ok) return { tracks: [], total: 0 };
+        const json = await response.json();
+
+        let rawResults = [];
+        if (Array.isArray(json)) {
+            rawResults = json;
+        } else if (json.success && json.data) {
+            rawResults = json.data.results || json.data.songs || json.data || [];
+        } else {
+            rawResults = json.songs || json.results || [];
+        }
+
+        if (!Array.isArray(rawResults) || rawResults.length === 0) return { tracks: [], total: 0 };
+
+        let tracks = rawResults.map((song, index) => {
+            const mapped = mapTrack(song);
+            // compute helpers
+            mapped._sourceRank = index;
+            mapped._relevance = queryRelevance(query, mapped.title, mapped.artist, mapped.album);
+            mapped._canon = canonicityScore(mapped.title);
+            mapped._popularity = Math.min(Math.log10(Math.max(1, mapped._playCount)) / 9, 1.0);
+            return mapped;
+        });
+
+        // Apply Jimmy scoring and dedupe by default
+        const qualifierRegex = /\b(live|remix|cover|instrumental|slowed|sped[\s-]?up|nightcore|reverb|karaoke|lofi)\b/i;
+        for (const t of tracks) {
+            t._isVersion = qualifierRegex.test(t.title);
+            t._jimmyScore = (t._canon * 0.55) + (t._relevance * 0.40) + (t._popularity * 0.05);
+        }
+
+        const dedupMap = new Map();
+        const versions = [];
+        for (const t of tracks) {
+            if (t._isVersion) { versions.push(t); continue; }
+            const baseTitle = normalize(t.title).replace(qualifierRegex, '').trim();
+            const artistKey = normalize(t.artist || '');
+            const key = baseTitle + '||' + artistKey;
+            if (!dedupMap.has(key)) dedupMap.set(key, t);
+            else {
+                const existing = dedupMap.get(key);
+                if (Math.abs((existing.duration || 0) - (t.duration || 0)) <= 3) {
+                    if ((t._jimmyScore || 0) > (existing._jimmyScore || 0)) dedupMap.set(key, t);
+                } else {
+                    // keep both by making a unique key
+                    dedupMap.set(key + '::' + (t.duration || 0), t);
+                }
+            }
+        }
+
+        const merged = Array.from(dedupMap.values()).concat(versions);
+        merged.sort((a, b) => (b._jimmyScore || 0) - (a._jimmyScore || 0));
+
+        const finalTracks = merged.slice(0, limit);
+        return { tracks: finalTracks, total: finalTracks.length };
+    } catch (error) {
+        console.warn(LOG_PREFIX, 'Search error:', error);
+        return { tracks: [{ id: 'err', title: `Error: ${error.message}`, artist: 'Try again', duration: 0, audioQuality: 'HIGH' }], total: 1 };
+    }
+}
+
+async function getTrackStreamUrl(trackId, preferredQuality, context) {
+    try {
+        const parts = String(trackId).split('||');
+        const realId = parts[0];
+        let directUrl = parts.length > 1 ? parts[1] : null;
+
+        if (!directUrl || directUrl === 'undefined' || directUrl === '') {
+            const response = await fetch(`${API_BASE}/song/?query=${encodeURIComponent(realId)}`, { headers: REQUEST_HEADERS });
+            if (!response.ok) throw new Error('HTTP ' + response.status);
+            const json = await response.json();
+            const songData = Array.isArray(json) ? json[0] : json;
+            if (songData) {
+                directUrl = songData.media_url || songData.url || '';
+                if (!directUrl && Array.isArray(songData.downloadUrl)) {
+                    directUrl = songData.downloadUrl[songData.downloadUrl.length - 1].url || songData.downloadUrl[songData.downloadUrl.length - 1].link;
+                }
+            }
+        }
+
+        if (directUrl) {
+            return {
+                streamUrl: directUrl.replace('http://', 'https://'),
+                streamType: 'mp4',
+                track: { id: realId, audioQuality: 'HIGH' }
+            };
+        }
+        throw new Error('No audio URL found');
+    } catch (error) {
+        throw error;
+    }
+}
+
+async function getAlbum(albumId) { throw new Error('Album fetch not supported yet'); }
+async function getArtist(artistId) { throw new Error('Artist fetch not supported yet'); }
+async function getLyrics(trackId) { return null; }
+
+return {
+    id: 'jiosaavn-vercel-jimmy',
+    name: 'JioSaavn (Jimmy)',
+    author: 'community',
+    version: '1.1.0-jimmy',
+    labels: ['JioSaavn', 'Bollywood', 'Vercel API', 'Jimmy'],
+    description: 'JioSaavn module with Jimmy-style ranking & dedupe applied by default.',
+    logo: 'https://upload.wikimedia.org/wikipedia/commons/3/35/JioSaavn-logo.png',
+    settings: {
+        quality: {
+            type: 'selector',
+            label: 'Audio Quality',
+            description: 'JioSaavn stream quality',
+            options: [ { label: 'High Quality', value: 'HIGH' } ],
+            defaultValue: 'HIGH'
+        }
+    },
+    searchTracks: searchTracks,
+    getTrackStreamUrl: getTrackStreamUrl,
+    getAlbum: getAlbum,
+    getArtist: getArtist,
+    getLyrics: getLyrics
+};
