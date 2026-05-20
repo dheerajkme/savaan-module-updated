@@ -1,0 +1,33 @@
+{
+  "category:modules": [
+    {
+      "id": "jiosaavn",
+      "name": "JioSaavn",
+      "pkg": "com.dheerajkme.module.jiosaavn",
+      "file": "jiosaavn.8spine",
+      "download": "https://dheerajkme.github.io/spine-jiosaavn-module/jiosaavn.8spine",
+      "version": "v1.0.1",
+      "code": 101,
+      "type": "MODULE",
+      "author": "community",
+      "description": "Stream from JioSaavn via custom API.",
+      "tags": [
+        "JioSaavn",
+        "Bollywood",
+        "Audio"
+      ],
+      "size": 5000,
+      "sizeLabel": "5 KB",
+      "logo": "https://upload.wikimedia.org/wikipedia/commons/3/35/JioSaavn-logo.png",
+      "icon": "https://upload.wikimedia.org/wikipedia/commons/3/35/JioSaavn-logo.png",
+      "sources": [
+        {
+          "name": "JioSaavn Custom",
+          "lang": "all",
+          "id": "jiosaavn-src",
+          "baseUrl": "."
+        }
+      ]
+    }
+  ]
+}
