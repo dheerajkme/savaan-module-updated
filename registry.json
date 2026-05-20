@@ -1,30 +1,31 @@
 {
   "category:modules": [
     {
-      "id": "jiosaavn",
-      "name": "JioSaavn",
-      "pkg": "com.dheerajkme.module.jiosaavn",
-      "file": "jiosaavn.8spine",
+      "id": "app-jiosaavn-jimmy",
+      "name": "jioSaavn (Jimmy Ranking)",
+      "pkg": "com.dheerajkme.module.jiosaavn.jimmy",
+      "file": "jiosaavn-jimmy.8spine",
       "download": "https://dheerajkme.github.io/savaan-module-updated/jiosaavn-jimmy.8spine",
-      "version": "v1.0.1",
+      "version": "v1.1.0",
       "code": 101,
       "type": "MODULE",
-      "author": "community",
-      "description": "Stream from JioSaavn via custom API.",
+      "author": "drJane",
+      "description": "Stream from JioSaavn via custom API ft jimmy ranking.",
       "tags": [
         "JioSaavn",
         "Bollywood",
-        "Audio"
+        "Audio",
+        "Smart Ranking"
       ],
       "size": 5000,
       "sizeLabel": "5 KB",
-      "logo": "https://upload.wikimedia.org/wikipedia/commons/3/35/JioSaavn-logo.png",
-      "icon": "https://upload.wikimedia.org/wikipedia/commons/3/35/JioSaavn-logo.png",
+      "logo": "https://ibb.co/Qj3ZWGnb",
+      "icon": "https://ibb.co/Qj3ZWGnb",
       "sources": [
         {
-          "name": "JioSaavn Custom",
+          "name": "JioSaavn Smart ranking",
           "lang": "all",
-          "id": "jiosaavn-src",
+          "id": "jiosaavn-jimmysrc",
           "baseUrl": "."
         }
       ]
