@@ -219,12 +219,12 @@ async function getArtist(artistId) { throw new Error('Artist fetch not supported
 async function getLyrics(trackId) { return null; }
 
 return {
-    id: 'jiosaavn-vercel-jimmy',
-    name: 'JioSaavn (Jimmy)',
+    id: 'app-jiosaavn-jimmy',
+    name: 'JioSaavn (Jimmy Ranking)',
     author: 'community',
     version: '1.1.0-jimmy',
-    labels: ['JioSaavn', 'Bollywood', 'Vercel API', 'Jimmy'],
-    description: 'JioSaavn module with Jimmy-style ranking & dedupe applied by default.',
+    labels: ['JioSaavn', 'Bollywood', 'Vercel API', 'Smart Ranking', 'Dedupe'],
+    description: 'JioSaavn for jiosaavn-jimmy app: Smart ranking with canonicity scoring (55%), relevance matching (40%), popularity weighting (5%), and automatic deduplication of versions.',
     logo: 'https://upload.wikimedia.org/wikipedia/commons/3/35/JioSaavn-logo.png',
     settings: {
         quality: {
