@@ -107,9 +107,11 @@ function mapTrack(song) {
     const albumId = (song.album && (song.album.id || song.album.albumid)) ? String(song.album.id || song.album.albumid) : null;
     const rawId = song.perma_url || song.id || song.songid || song.vcode || '';
     const compoundId = [String(rawId), bestAudio || '', encodeURIComponent(title), encodeURIComponent(artistName)].join('||');
+    const trackId = bestAudio || compoundId;
 
     return {
-        id: compoundId,
+        id: trackId,
+        sourceId: rawId,
         title: title,
         artist: artistName,
         artistId: artistId,
@@ -191,9 +193,17 @@ async function searchTracks(query, limit = 20) {
 
 async function getTrackStreamUrl(trackId, preferredQuality, context) {
     try {
+        if (/^https?:\/\//i.test(String(trackId))) {
+            return {
+                streamUrl: String(trackId).replace('http://', 'https://'),
+                streamType: 'mp4',
+                track: { id: String(trackId), audioQuality: 'HIGH' }
+            };
+        }
+
         const parts = String(trackId).split('||');
         const realId = parts[0];
-        let directUrl = parts.length > 1 ? parts[1] : null;
+        const embeddedUrl = parts.length > 1 ? parts[1] : null;
         const encodedTitle = parts.length > 2 ? parts[2] : '';
         const encodedArtist = parts.length > 3 ? parts[3] : '';
         const idTitle = encodedTitle ? decodeURIComponent(encodedTitle) : '';
@@ -201,31 +211,38 @@ async function getTrackStreamUrl(trackId, preferredQuality, context) {
         const contextTrack = context && (context.track || context);
         const lookupTitle = (contextTrack && (contextTrack.title || contextTrack.song || contextTrack.name)) || idTitle;
         const lookupArtist = (contextTrack && (contextTrack.artist || contextTrack.primary_artists || contextTrack.primaryArtists)) || idArtist;
+        const lookupQuery = [lookupTitle, lookupArtist].filter(Boolean).join(' ').trim() || realId;
+        let directUrl = null;
+        try {
+            const response = await fetch(`${API_BASE}/result/?query=${encodeURIComponent(lookupQuery)}&limit=10`, { headers: REQUEST_HEADERS });
+            if (response.ok) {
+                const json = await response.json();
+                const candidates = parseSaavnResults(json).map(mapTrack);
+                let chosen = null;
+                let bestScore = -1;
+                for (const candidate of candidates) {
+                    let score = queryRelevance(lookupQuery, candidate.title, candidate.artist, candidate.album);
+                    if (normalize(candidate.title) === normalize(lookupTitle)) score += 0.8;
+                    if (normalize(candidate.artist) === normalize(lookupArtist)) score += 0.6;
+                    score += canonicityScore(candidate.title) * 0.15;
+                    if (score > bestScore) {
+                        bestScore = score;
+                        chosen = candidate;
+                    }
+                }
+                if (chosen && chosen._raw) {
+                    directUrl = chosen._raw.media_url || chosen._raw.url || '';
+                    if (!directUrl && Array.isArray(chosen._raw.downloadUrl)) {
+                        directUrl = chosen._raw.downloadUrl[chosen._raw.downloadUrl.length - 1].url || chosen._raw.downloadUrl[chosen._raw.downloadUrl.length - 1].link || '';
+                    }
+                }
+            }
+        } catch (lookupError) {
+            directUrl = null;
+        }
 
         if (!directUrl || directUrl === 'undefined' || directUrl === '') {
-            const lookupQuery = [lookupTitle, lookupArtist].filter(Boolean).join(' ').trim() || realId;
-            const response = await fetch(`${API_BASE}/result/?query=${encodeURIComponent(lookupQuery)}&limit=10`, { headers: REQUEST_HEADERS });
-            if (!response.ok) throw new Error('HTTP ' + response.status);
-            const json = await response.json();
-            const candidates = parseSaavnResults(json).map(mapTrack);
-            let chosen = null;
-            let bestScore = -1;
-            for (const candidate of candidates) {
-                let score = queryRelevance(lookupQuery, candidate.title, candidate.artist, candidate.album);
-                if (normalize(candidate.title) === normalize(lookupTitle)) score += 0.8;
-                if (normalize(candidate.artist) === normalize(lookupArtist)) score += 0.6;
-                score += canonicityScore(candidate.title) * 0.15;
-                if (score > bestScore) {
-                    bestScore = score;
-                    chosen = candidate;
-                }
-            }
-            if (chosen && chosen._raw) {
-                directUrl = chosen._raw.media_url || chosen._raw.url || '';
-                if (!directUrl && Array.isArray(chosen._raw.downloadUrl)) {
-                    directUrl = chosen._raw.downloadUrl[chosen._raw.downloadUrl.length - 1].url || chosen._raw.downloadUrl[chosen._raw.downloadUrl.length - 1].link || '';
-                }
-            }
+            directUrl = embeddedUrl;
         }
 
         if (directUrl) {
