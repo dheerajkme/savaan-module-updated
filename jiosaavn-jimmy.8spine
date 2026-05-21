@@ -74,6 +74,13 @@ function extractBestImage(imageObj) {
     return '';
 }
 
+function parseSaavnResults(json) {
+    let rawResults = [];
+    if (Array.isArray(json)) rawResults = json;
+    else rawResults = json && json.data && (json.data.results || json.data.songs) ? (json.data.results || json.data.songs) : (json && json.data ? json.data : []);
+    return Array.isArray(rawResults) ? rawResults : [];
+}
+
 function mapTrack(song) {
     const bestImage = extractBestImage(song.image || song.image_url || song.thumbnail || '');
     let bestAudio = song.media_url || song.url || '';
@@ -99,7 +106,7 @@ function mapTrack(song) {
     const albumName = (song.album && song.album.name) ? song.album.name : (typeof song.album === 'string' ? song.album : 'Unknown Album');
     const albumId = (song.album && (song.album.id || song.album.albumid)) ? String(song.album.id || song.album.albumid) : null;
     const rawId = song.perma_url || song.id || song.songid || song.vcode || '';
-    const compoundId = String(rawId) + '||' + (bestAudio || '');
+    const compoundId = [String(rawId), bestAudio || '', encodeURIComponent(title), encodeURIComponent(artistName)].join('||');
 
     return {
         id: compoundId,
@@ -187,16 +194,36 @@ async function getTrackStreamUrl(trackId, preferredQuality, context) {
         const parts = String(trackId).split('||');
         const realId = parts[0];
         let directUrl = parts.length > 1 ? parts[1] : null;
+        const encodedTitle = parts.length > 2 ? parts[2] : '';
+        const encodedArtist = parts.length > 3 ? parts[3] : '';
+        const idTitle = encodedTitle ? decodeURIComponent(encodedTitle) : '';
+        const idArtist = encodedArtist ? decodeURIComponent(encodedArtist) : '';
+        const contextTrack = context && (context.track || context);
+        const lookupTitle = (contextTrack && (contextTrack.title || contextTrack.song || contextTrack.name)) || idTitle;
+        const lookupArtist = (contextTrack && (contextTrack.artist || contextTrack.primary_artists || contextTrack.primaryArtists)) || idArtist;
 
         if (!directUrl || directUrl === 'undefined' || directUrl === '') {
-            const response = await fetch(`${API_BASE}/song/?query=${encodeURIComponent(realId)}`, { headers: REQUEST_HEADERS });
+            const lookupQuery = [lookupTitle, lookupArtist].filter(Boolean).join(' ').trim() || realId;
+            const response = await fetch(`${API_BASE}/result/?query=${encodeURIComponent(lookupQuery)}&limit=10`, { headers: REQUEST_HEADERS });
             if (!response.ok) throw new Error('HTTP ' + response.status);
             const json = await response.json();
-            const songData = Array.isArray(json) ? json[0] : json;
-            if (songData) {
-                directUrl = songData.media_url || songData.url || '';
-                if (!directUrl && Array.isArray(songData.downloadUrl)) {
-                    directUrl = songData.downloadUrl[songData.downloadUrl.length - 1].url || songData.downloadUrl[songData.downloadUrl.length - 1].link;
+            const candidates = parseSaavnResults(json).map(mapTrack);
+            let chosen = null;
+            let bestScore = -1;
+            for (const candidate of candidates) {
+                let score = queryRelevance(lookupQuery, candidate.title, candidate.artist, candidate.album);
+                if (normalize(candidate.title) === normalize(lookupTitle)) score += 0.8;
+                if (normalize(candidate.artist) === normalize(lookupArtist)) score += 0.6;
+                score += canonicityScore(candidate.title) * 0.15;
+                if (score > bestScore) {
+                    bestScore = score;
+                    chosen = candidate;
+                }
+            }
+            if (chosen && chosen._raw) {
+                directUrl = chosen._raw.media_url || chosen._raw.url || '';
+                if (!directUrl && Array.isArray(chosen._raw.downloadUrl)) {
+                    directUrl = chosen._raw.downloadUrl[chosen._raw.downloadUrl.length - 1].url || chosen._raw.downloadUrl[chosen._raw.downloadUrl.length - 1].link || '';
                 }
             }
         }
