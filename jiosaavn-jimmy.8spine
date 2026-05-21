@@ -15,11 +15,14 @@ const REQUEST_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
 };
 
+const TITLE_SIMILARITY_MIN = 0.82;
+const ARTIST_SIMILARITY_MIN = 0.50;
+
 // Reuse helpers from the original module
 function normalize(s) {
     if (!s) return '';
     let out = String(s).toLowerCase();
-    if (typeof out.normalize === 'function') out = out.normalize('NFKD').replace(/[\u0000-\u036f]/g, '');
+    if (typeof out.normalize === 'function') out = out.normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
     return out.replace(/\([^)]*\)|\[[^\]]*\]/g, ' ').replace(/feat\.?|featuring|ft\.?|with\s+/gi, ' ').replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
@@ -72,6 +75,112 @@ function extractBestImage(imageObj) {
     if (Array.isArray(imageObj) && imageObj.length > 0) return imageObj[imageObj.length - 1].url || imageObj[imageObj.length - 1].link || '';
     if (typeof imageObj === 'string') return imageObj;
     return '';
+}
+
+function safeDecode(value) {
+    if (!value) return '';
+    try { return decodeURIComponent(value); } catch (error) { return String(value); }
+}
+
+function trackVersionType(title) {
+    const text = String(title || '').toLowerCase();
+    if (/\(live[^)]*\)|\[live[^\]]*\]|\s[-\u2013\u2014]\s+live\b|\blive\s+at\s+\w|\blive\s+from\s+\w|\blive\s+in\s+\w/.test(text)) return 'live';
+    if (/\bremix\b|\(.+\s+mix\)|\s[-\u2013\u2014]\s+.+\bmix\b|\bvip\s+mix\b|\bdub\s+mix\b|\bclub\s+mix\b|\brefix\b|\bbootleg\b|\bedit\b\)|\s[-\u2013\u2014]\s+.+\b(edit|version|cut)\b/.test(text)) return 'remix';
+    if (/\bacoustic\b|\bunplugged\b/.test(text)) return 'acoustic';
+    if (/\bdemo\b/.test(text)) return 'demo';
+    if (/\binstrumental\b|\bkaraoke\b/.test(text)) return 'instrumental';
+    if (/\bcover\b/.test(text)) return 'cover';
+    if (/\bslowed\b|\bsped[\s-]?up\b|\bnightcore\b|\breverb\b|\b8d\b|\bbass[\s-]?boost(ed)?\b/.test(text)) return 'edit';
+    return null;
+}
+
+function stripVersionTags(title) {
+    if (!title) return '';
+    return String(title)
+        .replace(/\s*[-\u2013\u2014]\s*(remaster(ed)?|live|acoustic|edit|version|mix|mono|stereo)[^,)]*$/i, '')
+        .replace(/\s*\([^)]*(remaster|live|acoustic|edit|version|mix|mono|stereo)[^)]*\)\s*$/i, '')
+        .trim();
+}
+
+function isSameRecording(a, b) {
+    if (!a || !b) return false;
+    if (trackVersionType(a.title) !== trackVersionType(b.title)) return false;
+    if (similarity(stripVersionTags(a.title), stripVersionTags(b.title)) < TITLE_SIMILARITY_MIN) return false;
+    if (similarity(a.artist, b.artist) < ARTIST_SIMILARITY_MIN) return false;
+    const maxDur = Math.max(a.duration || 0, b.duration || 0);
+    let tolerance = 3;
+    if (maxDur > 480) tolerance = 5;
+    if (maxDur > 720) tolerance = 8;
+    if (maxDur > 1200) tolerance = 12;
+    if (a.duration && b.duration && Math.abs(a.duration - b.duration) > tolerance) return false;
+    return true;
+}
+
+function queryIntent(query) {
+    const text = String(query || '').toLowerCase();
+    return {
+        wantsLive: /\blive\b/.test(text),
+        wantsRemix: /\bremix\b|\bmix\b/.test(text),
+        wantsAcoustic: /\bacoustic\b|\bunplugged\b/.test(text),
+        wantsRemaster: /\bremaster(ed)?\b/.test(text),
+        wantsDemo: /\bdemo\b/.test(text),
+        wantsInstrumental: /\binstrumental\b|\bkaraoke\b/.test(text),
+        wantsCover: /\bcover\b/.test(text),
+        wantsSlowed: /\bslowed\b/.test(text),
+        wantsSpedUp: /\bsped[\s-]?up\b|\bspeed[\s-]?up\b/.test(text),
+        wantsNightcore: /\bnightcore\b/.test(text),
+        wantsReverb: /\breverb\b/.test(text),
+        wants8D: /\b8d\b|\b8-d\b/.test(text),
+        wantsBassBoost: /\bbass[\s-]?boost(ed)?\b/.test(text),
+        wantsExtended: /\bextended\b/.test(text)
+    };
+}
+
+function canonicityScoreJimmy(track, intent) {
+    if (!track) return 1.0;
+    const title = String(track.title || '').toLowerCase();
+    const album = String(track.album || '').toLowerCase();
+    let score = 1.0;
+    intent = intent || {};
+    const hasLive = /\(live[^)]*\)|\[live[^\]]*\]|\s[-\u2013\u2014]\s+live\b|\blive\s+at\s+\w|\blive\s+from\s+\w|\blive\s+in\s+\w/i.test(title);
+    const hasDemo = /\bdemo\b|\bdemos\b/i.test(title);
+    const hasInstrumental = /\binstrumental\b|\bkaraoke\b/i.test(title);
+    const hasCover = /\bcover\b/i.test(title);
+    const hasRemix = /\bremix\b|\bmix\b/i.test(title);
+    const hasRemaster = /\bremaster(ed)?\b/i.test(title);
+    const hasAcoustic = /\bacoustic\b|\bunplugged\b/i.test(title);
+    const hasSlowed = /\bslowed\b/i.test(title);
+    const hasSpedUp = /\bsped[\s-]?up\b|\bspeed[\s-]?up\b/i.test(title);
+    const hasNightcore = /\bnightcore\b/i.test(title);
+    const hasReverb = /\breverb\b/i.test(title);
+    const has8D = /\b8d\b|\b8-d\b/i.test(title);
+    const hasBassBoost = /\bbass[\s-]?boost(ed)?\b/i.test(title);
+    const hasExtended = /\bextended\b/i.test(title);
+    const hasSuperUltra = /\b(super|ultra|mega|hyper)\b/i.test(title) && (hasSlowed || hasSpedUp);
+
+    if (hasLive) score += intent.wantsLive ? 0.50 : -0.40;
+    if (hasDemo) score += intent.wantsDemo ? 0.50 : -0.30;
+    if (hasInstrumental) score += intent.wantsInstrumental ? 0.50 : -0.50;
+    if (hasCover) score += intent.wantsCover ? 0.50 : -0.35;
+    if (hasRemix) score += intent.wantsRemix ? 0.30 : -0.10;
+    if (hasRemaster) score += intent.wantsRemaster ? 0.30 : -0.05;
+    if (hasAcoustic) score += intent.wantsAcoustic ? 0.50 : -0.20;
+    if (hasSlowed) score += intent.wantsSlowed ? 0.50 : -0.70;
+    if (hasSpedUp) score += intent.wantsSpedUp ? 0.50 : -0.70;
+    if (hasNightcore) score += intent.wantsNightcore ? 0.50 : -0.70;
+    if (hasReverb) score += intent.wantsReverb ? 0.40 : -0.55;
+    if (has8D) score += intent.wants8D ? 0.40 : -0.65;
+    if (hasBassBoost) score += intent.wantsBassBoost ? 0.40 : -0.55;
+    if (hasExtended) score += intent.wantsExtended ? 0.30 : -0.25;
+    if (hasSuperUltra && !(intent.wantsSlowed || intent.wantsSpedUp)) score -= 0.20;
+    if (/\bgreatest hits?\b|\(greatest\)|\bbest of\b|\bessentials\b|\bcollection\b|\banthology\b|\bcompilation\b/i.test(album)) score -= 0.12;
+    if (/\bsoundtrack\b|\bo\.s\.t\b|\boriginal motion picture\b/i.test(album)) score -= 0.15;
+    if (/\blive\b/i.test(album) && !hasLive) score -= 0.15;
+    if (/\bslowed\b|\bsped\b|\bnightcore\b|\b8d\b|\breverb\b/i.test(album) && !(hasSlowed || hasSpedUp || hasNightcore || has8D || hasReverb)) score -= 0.30;
+    if (!/\(.+\)|\s[-\u2013\u2014]\s/.test(title)) score += 0.15;
+    if (score < 0.10) score = 0.10;
+    if (score > 1.30) score = 1.30;
+    return score;
 }
 
 function parseSaavnResults(json) {
