@@ -8,17 +8,16 @@
 
 const LOG_PREFIX = '[JioSaavn-JIMMY]';
 // Using the new Vercel deployment endpoint
-const API_BASE = 'https://saavnapi-nine.vercel.app'; 
+const API_BASE = 'https://saavnapi-nine.vercel.app';
 
 const REQUEST_HEADERS = {
     'Accept': 'application/json',
     'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
 };
 
-const TITLE_SIMILARITY_MIN = 0.82;
-const ARTIST_SIMILARITY_MIN = 0.50;
+const TITLE_SIMILARITY_MIN = 0.88;
+const ARTIST_SIMILARITY_MIN = 0.70;
 
-// Reuse helpers from the original module
 function normalize(s) {
     if (!s) return '';
     let out = String(s).toLowerCase();
@@ -52,12 +51,14 @@ function queryRelevance(query, title, artist, album) {
     let hits = 0;
     for (let i = 0; i < qTokens.length; i++) if (hay.includes(qTokens[i])) hits++;
     let base = hits / qTokens.length;
-    if (hits < qTokens.length) base = base * 0.3; 
+    if (hits < qTokens.length) base = base * 0.3;
     if (similarity(query, normalize(artist || '')) > 0.80) base = Math.min(1.3, base + 0.30);
     if (similarity(query, normalize(title || '')) > 0.80) base = Math.min(1.3, base + 0.30);
     return base;
 }
 
+// FIX 1: canonicityScore — square-bracket tags like [Full Song] [Official Video] now
+// correctly blocked from the clean-title bonus, and get an extra penalty on top.
 function canonicityScore(title) {
     if (!title) return 1.0;
     const t = String(title).toLowerCase();
@@ -67,7 +68,10 @@ function canonicityScore(title) {
     if (/\bcover\b/i.test(t)) score -= 0.35;
     if (/\bslowed\b|\bsped[\s-]?up\b|\bnightcore\b|\breverb\b|\b8d\b/i.test(t)) score -= 0.70;
     if (/\bremix\b|\bmix\b/i.test(t)) score -= 0.10;
-    if (!/\(.+\)|\s[-\u2013\u2014]\s/.test(t)) score += 0.20;
+    // Penalise YouTube-rip spam tags found in square brackets
+    if (/\[(full\s*(song|video|audio|hd|hq)|official\s*(video|audio|song|music\s*video)|video\s*song|lyric(s)?\s*video|audio\s*jukebox)\]/i.test(t)) score -= 0.30;
+    // FIX: also block [] square-bracket titles from getting the clean-title bonus
+    if (!/\(.+\)|\[.+\]|\s[-\u2013\u2014]\s/.test(t)) score += 0.20;
     return Math.max(0.10, Math.min(score, 1.30));
 }
 
@@ -100,6 +104,8 @@ function stripVersionTags(title) {
     return String(title)
         .replace(/\s*[-\u2013\u2014]\s*(remaster(ed)?|live|acoustic|edit|version|mix|mono|stereo)[^,)]*$/i, '')
         .replace(/\s*\([^)]*(remaster|live|acoustic|edit|version|mix|mono|stereo)[^)]*\)\s*$/i, '')
+        .replace(/\s+from\s+[^,()\-\u2013\u2014]+$/i, '')
+        .replace(/\b(full song|full video|official video|video song|original motion picture)\b/gi, '')
         .trim();
 }
 
@@ -109,10 +115,12 @@ function isSameRecording(a, b) {
     if (similarity(stripVersionTags(a.title), stripVersionTags(b.title)) < TITLE_SIMILARITY_MIN) return false;
     if (similarity(a.artist, b.artist) < ARTIST_SIMILARITY_MIN) return false;
     const maxDur = Math.max(a.duration || 0, b.duration || 0);
-    let tolerance = 3;
-    if (maxDur > 480) tolerance = 5;
-    if (maxDur > 720) tolerance = 8;
-    if (maxDur > 1200) tolerance = 12;
+    let tolerance;
+    if (maxDur < 180) tolerance = 1.5;
+    else if (maxDur < 480) tolerance = 3;
+    else if (maxDur < 720) tolerance = 5;
+    else if (maxDur < 1200) tolerance = 8;
+    else tolerance = 12;
     if (a.duration && b.duration && Math.abs(a.duration - b.duration) > tolerance) return false;
     return true;
 }
@@ -137,6 +145,7 @@ function queryIntent(query) {
     };
 }
 
+// FIX 2: canonicityScoreJimmy — same square-bracket clean-title bonus fix applied here too.
 function canonicityScoreJimmy(track, intent) {
     if (!track) return 1.0;
     const title = String(track.title || '').toLowerCase();
@@ -178,7 +187,8 @@ function canonicityScoreJimmy(track, intent) {
     if (/\bsoundtrack\b|\bo\.s\.t\b|\boriginal motion picture\b/i.test(album)) score -= 0.15;
     if (/\blive\b/i.test(album) && !hasLive) score -= 0.15;
     if (/\bslowed\b|\bsped\b|\bnightcore\b|\b8d\b|\breverb\b/i.test(album) && !(hasSlowed || hasSpedUp || hasNightcore || has8D || hasReverb)) score -= 0.30;
-    if (!/\(.+\)|\s[-\u2013\u2014]\s/.test(title)) score += 0.15;
+    // FIX: block [] square-bracket titles from the clean-title bonus (same as canonicityScore)
+    if (!/\(.+\)|\[.+\]|\s[-\u2013\u2014]\s/.test(title)) score += 0.15;
     if (score < 0.10) score = 0.10;
     if (score > 1.30) score = 1.30;
     return score;
@@ -191,6 +201,8 @@ function parseSaavnResults(json) {
     return Array.isArray(rawResults) ? rawResults : [];
 }
 
+// FIX 3: mapTrack — album is now stored as part 5 of the compound ID so that
+// getTrackStreamUrl can use it for disambiguation when re-searching.
 function mapTrack(song) {
     const bestImage = extractBestImage(song.image || song.image_url || song.thumbnail || '');
     let bestAudio = song.media_url || song.url || '';
@@ -216,7 +228,15 @@ function mapTrack(song) {
     const albumName = (song.album && song.album.name) ? song.album.name : (typeof song.album === 'string' ? song.album : 'Unknown Album');
     const albumId = (song.album && (song.album.id || song.album.albumid)) ? String(song.album.id || song.album.albumid) : null;
     const rawId = song.perma_url || song.id || song.songid || song.vcode || '';
-    const compoundId = [String(rawId), bestAudio || '', encodeURIComponent(title), encodeURIComponent(artistName)].join('||');
+    // FIX 3: albumName added as part 5 so the stream lookup can disambiguate
+    // "Tere Naina (MNIK)" vs "Tere Naina (CCtC)" purely from the stored ID.
+    const compoundId = [
+        String(rawId),
+        bestAudio || '',
+        encodeURIComponent(title),
+        encodeURIComponent(artistName),
+        encodeURIComponent(albumName)   // <-- NEW
+    ].join('||');
     const trackId = bestAudio || compoundId;
 
     return {
@@ -231,12 +251,10 @@ function mapTrack(song) {
         duration: parseInt(song.duration) || 0,
         audioQuality: 'HIGH',
         _playCount: parseInt(song.play_count) || parseInt(song.playCount) || 0,
-        // keep raw payload if needed
         _raw: song
     };
 }
 
-// JIMMY-enabled searchTracks: applies Jimmy scoring and dedupe by default
 async function searchTracks(query, limit = 20) {
     try {
         const intent = queryIntent(query);
@@ -258,7 +276,6 @@ async function searchTracks(query, limit = 20) {
 
         let tracks = rawResults.map((song, index) => {
             const mapped = mapTrack(song);
-            // compute helpers
             mapped._sourceRank = index;
             mapped._relevance = queryRelevance(query, mapped.title, mapped.artist, mapped.album);
             mapped._canon = canonicityScore(mapped.title);
@@ -268,24 +285,26 @@ async function searchTracks(query, limit = 20) {
             return mapped;
         });
 
-        // Apply Jimmy scoring and dedupe by default
         for (const t of tracks) {
             t._versionPenalty = t._isVersion && !versionRequested ? 0.95 : 0;
             t._jimmyScore = (t._canon * 0.55) + (t._relevance * 0.40) + (t._popularity * 0.05) - t._versionPenalty;
         }
 
+        // FIX 4: Dedup key — normalize the title side so that "Sajdaa" and "Sajda"
+        // (same song, slightly different API spellings) collapse into one entry instead
+        // of both surviving and confusing downstream scoring.
         const dedupMap = new Map();
         for (const t of tracks) {
-            const baseTitle = stripVersionTags(t.title) || normalize(t.title);
+            const baseTitle = normalize(stripVersionTags(t.title) || t.title);  // <-- now normalized
             const artistKey = normalize(t.artist || '');
             const key = baseTitle + '||' + artistKey;
-            if (!dedupMap.has(key)) dedupMap.set(key, t);
-            else {
+            if (!dedupMap.has(key)) {
+                dedupMap.set(key, t);
+            } else {
                 const existing = dedupMap.get(key);
                 if (Math.abs((existing.duration || 0) - (t.duration || 0)) <= 3) {
                     if ((t._jimmyScore || 0) > (existing._jimmyScore || 0)) dedupMap.set(key, t);
                 } else {
-                    // keep both by making a unique key
                     dedupMap.set(key + '::' + (t.duration || 0), t);
                 }
             }
@@ -306,6 +325,13 @@ async function searchTracks(query, limit = 20) {
     }
 }
 
+// FIX 5: getTrackStreamUrl — four sub-fixes:
+//   a) Album is now extracted from compound ID part 5.
+//   b) lookupQuery includes album so the API returns the right song pool.
+//   c) Artist + title matching uses similarity() instead of strict equality,
+//      catching "&" vs "," and other minor formatting differences.
+//   d) Album similarity is scored explicitly, giving a strong disambiguation
+//      signal for same-title songs across different films (e.g. "Tere Naina").
 async function getTrackStreamUrl(trackId, preferredQuality, context) {
     try {
         if (/^https?:\/\//i.test(String(trackId))) {
@@ -317,38 +343,75 @@ async function getTrackStreamUrl(trackId, preferredQuality, context) {
         }
 
         const parts = String(trackId).split('||');
-        const realId = parts[0];
-        const embeddedUrl = parts.length > 1 ? parts[1] : null;
-        const encodedTitle = parts.length > 2 ? parts[2] : '';
+        const realId       = parts[0];
+        const embeddedUrl  = parts.length > 1 ? parts[1] : null;
+        const encodedTitle  = parts.length > 2 ? parts[2] : '';
         const encodedArtist = parts.length > 3 ? parts[3] : '';
-        const idTitle = encodedTitle ? decodeURIComponent(encodedTitle) : '';
+        const encodedAlbum  = parts.length > 4 ? parts[4] : '';  // FIX 5a
+
+        const idTitle  = encodedTitle  ? decodeURIComponent(encodedTitle)  : '';
         const idArtist = encodedArtist ? decodeURIComponent(encodedArtist) : '';
-        const contextTrack = context && (context.track || context);
-        const lookupTitle = (contextTrack && (contextTrack.title || contextTrack.song || contextTrack.name)) || idTitle;
-        const lookupArtist = (contextTrack && (contextTrack.artist || contextTrack.primary_artists || contextTrack.primaryArtists)) || idArtist;
-        const lookupQuery = [lookupTitle, lookupArtist].filter(Boolean).join(' ').trim() || realId;
+        const idAlbum  = encodedAlbum  ? decodeURIComponent(encodedAlbum)  : '';  // FIX 5a
+
+        const contextTrack  = context && (context.track || context);
+        const lookupTitle   = (contextTrack && (contextTrack.title  || contextTrack.song || contextTrack.name))            || idTitle;
+        const lookupArtist  = (contextTrack && (contextTrack.artist || contextTrack.primary_artists || contextTrack.primaryArtists)) || idArtist;
+        const lookupAlbum   = (contextTrack && contextTrack.album)  || idAlbum;  // FIX 5a
+
+        // FIX 5b: include album in the search query — pulls the right film's version
+        // to the top of the API results before we even start scoring.
+        const lookupQuery = [lookupTitle, lookupArtist, lookupAlbum]
+            .map(s => (s || '').trim())
+            .filter(Boolean)
+            .join(' ')
+            .trim() || realId;
+
         let directUrl = null;
         try {
             const response = await fetch(`${API_BASE}/result/?query=${encodeURIComponent(lookupQuery)}&limit=10`, { headers: REQUEST_HEADERS });
             if (response.ok) {
                 const json = await response.json();
                 const candidates = parseSaavnResults(json).map(mapTrack);
-                let chosen = null;
-                let bestScore = -1;
+
+                let chosen    = null;
+                let bestScore = -Infinity;
+
                 for (const candidate of candidates) {
                     let score = queryRelevance(lookupQuery, candidate.title, candidate.artist, candidate.album);
-                    if (normalize(candidate.title) === normalize(lookupTitle)) score += 0.8;
-                    if (normalize(candidate.artist) === normalize(lookupArtist)) score += 0.6;
-                    score += canonicityScore(candidate.title) * 0.15;
+
+                    // FIX 5c: similarity-based title/artist matching instead of strict equality.
+                    // Handles "&" vs "," differences, extra spaces, Unicode punctuation, etc.
+                    const titleSim  = similarity(candidate.title,  lookupTitle);
+                    const artistSim = similarity(candidate.artist, lookupArtist);
+
+                    if (titleSim >= 0.90)       score += 0.80;
+                    else if (titleSim >= 0.75)  score += 0.40;
+
+                    if (artistSim >= 0.75)      score += 0.60 * artistSim;  // proportional reward
+                    else if (artistSim < 0.30)  score -= 0.30;              // clear mismatch penalty
+
+                    // FIX 5d: album similarity — the primary fix for "Tere Naina" and "Sajdaa".
+                    // Same song title in two films now resolves to the correct one.
+                    if (lookupAlbum) {
+                        const albumSim = similarity(candidate.album, lookupAlbum);
+                        if (albumSim >= 0.75)      score += 0.50;   // strong same-album signal
+                        else if (albumSim < 0.20)  score -= 0.20;   // penalise clearly wrong album
+                    }
+
+                    score += canonicityScore(candidate.title) * 0.10;
+
                     if (score > bestScore) {
                         bestScore = score;
-                        chosen = candidate;
+                        chosen    = candidate;
                     }
                 }
+
                 if (chosen && chosen._raw) {
                     directUrl = chosen._raw.media_url || chosen._raw.url || '';
                     if (!directUrl && Array.isArray(chosen._raw.downloadUrl)) {
-                        directUrl = chosen._raw.downloadUrl[chosen._raw.downloadUrl.length - 1].url || chosen._raw.downloadUrl[chosen._raw.downloadUrl.length - 1].link || '';
+                        directUrl = chosen._raw.downloadUrl[chosen._raw.downloadUrl.length - 1].url
+                                 || chosen._raw.downloadUrl[chosen._raw.downloadUrl.length - 1].link
+                                 || '';
                     }
                 }
             }
@@ -373,9 +436,9 @@ async function getTrackStreamUrl(trackId, preferredQuality, context) {
     }
 }
 
-async function getAlbum(albumId) { throw new Error('Album fetch not supported yet'); }
+async function getAlbum(albumId)  { throw new Error('Album fetch not supported yet'); }
 async function getArtist(artistId) { throw new Error('Artist fetch not supported yet'); }
-async function getLyrics(trackId) { return null; }
+async function getLyrics(trackId)  { return null; }
 
 return {
     id: 'app-jiosaavn-jimmy',
@@ -394,9 +457,9 @@ return {
             defaultValue: 'HIGH'
         }
     },
-    searchTracks: searchTracks,
+    searchTracks:      searchTracks,
     getTrackStreamUrl: getTrackStreamUrl,
-    getAlbum: getAlbum,
-    getArtist: getArtist,
-    getLyrics: getLyrics
+    getAlbum:          getAlbum,
+    getArtist:         getArtist,
+    getLyrics:         getLyrics
 };
