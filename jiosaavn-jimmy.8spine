@@ -259,6 +259,7 @@ async function fetchDirectSearchCandidates(queries, limit) {
             for (var i = 0; i < results.length && out.length < limit; i++) {
                 const item = results[i];
                 const mapped = mapTrack(item);
+                mapped._source = 'direct';
                 const key = normalize(mapped.title) + '||' + normalize(mapped.artist) + '||' + normalize(mapped.album);
                 if (seen[key]) continue;
                 seen[key] = true;
@@ -335,6 +336,22 @@ async function fetchEndpointJson(url, headers) {
     } catch (error) {
         return null;
     }
+}
+
+async function hydrateMediaUrl(permaUrl) {
+    if (!permaUrl) return null;
+    const details = await fetchEndpointJson(
+        `${API_BASE}/song/?query=${encodeURIComponent(permaUrl)}`,
+        REQUEST_HEADERS
+    );
+    if (!details) return null;
+    if (details.media_url) return details.media_url;
+    if (details.url) return details.url;
+    if (Array.isArray(details.downloadUrl) && details.downloadUrl.length) {
+        const last = details.downloadUrl[details.downloadUrl.length - 1];
+        return last && (last.url || last.link) || null;
+    }
+    return null;
 }
 
 function mapTrack(song) {
@@ -425,6 +442,7 @@ async function searchTracks(query, limit = 20) {
 
             for (var d = 0; d < directCandidates.length; d++) {
                 const candidate = directCandidates[d];
+                candidate._source = candidate._source || 'direct';
                 const key = normalize(candidate.title) + '||' + normalize(candidate.artist) + '||' + normalize(candidate.album);
                 if (mergedSeen[key]) continue;
                 mergedSeen[key] = true;
@@ -526,13 +544,19 @@ async function getTrackStreamUrl(trackId, preferredQuality, context) {
             });
 
             // If API search misses the exact song but we have a song URL, hydrate via /song.
-            if ((!candidates.length || !candidates.some(c => titleMatchScore(c.title, lookupTitle) >= 0.80)) && realId && realId.indexOf('http') === 0) {
+            const hasStrongWrapperCandidate = candidates.some(function (candidate) {
+                const titleOk = titleMatchScore(candidate.title, lookupTitle) >= 0.80;
+                const artistOk = !lookupArtist || similarity(candidate.artist, lookupArtist) >= 0.60;
+                return titleOk && artistOk;
+            });
+
+            if ((!candidates.length || !hasStrongWrapperCandidate) && realId && realId.indexOf('http') === 0) {
                 const songPayload = await fetchEndpointJson(`${API_BASE}/song/?query=${encodeURIComponent(realId)}`);
                 const songCandidates = parseEndpointPayload(songPayload).map(mapTrack);
                 if (songCandidates.length) candidates = songCandidates;
             }
 
-            if (!candidates.length || !candidates.some(c => titleMatchScore(c.title, lookupTitle) >= 0.80)) {
+            if (!candidates.length || !hasStrongWrapperCandidate) {
                 const directCandidates = await fetchDirectSearchCandidates(candidateSearchQueries(lookupTitle, lookupArtist, lookupAlbum), 20);
                 if (directCandidates.length) candidates = candidates.concat(directCandidates);
             }
@@ -585,7 +609,7 @@ async function getTrackStreamUrl(trackId, preferredQuality, context) {
                         throw new Error('No confident title match found for stream resolution');
                     }
                 }
-                if (chosen && lookupArtist) {
+                if (chosen && lookupArtist && chosen._source !== 'direct') {
                     const as = similarity(chosen.artist, lookupArtist);
                     if (as < 0.60) {
                         throw new Error('No confident artist match found for stream resolution');
@@ -595,6 +619,28 @@ async function getTrackStreamUrl(trackId, preferredQuality, context) {
                     directUrl = chosen._raw.media_url || chosen._raw.url || '';
                     if (!directUrl && Array.isArray(chosen._raw.downloadUrl)) {
                         directUrl = chosen._raw.downloadUrl[chosen._raw.downloadUrl.length - 1].url || chosen._raw.downloadUrl[chosen._raw.downloadUrl.length - 1].link || '';
+                    }
+                    if (!directUrl && chosen._raw.perma_url) {
+                        try { directUrl = await hydrateMediaUrl(chosen._raw.perma_url); } catch (e) {}
+                    }
+                    if (!directUrl && chosen.sourceId && String(chosen.sourceId).indexOf('http') === 0) {
+                        try { directUrl = await hydrateMediaUrl(chosen.sourceId); } catch (e) {}
+                    }
+                }
+
+                if (!directUrl) {
+                    for (const candidate of candidates) {
+                        const perma = candidate && candidate._raw && candidate._raw.perma_url;
+                        if (!perma) continue;
+                        try {
+                            directUrl = await hydrateMediaUrl(perma);
+                            if (directUrl) {
+                                console.debug(LOG_PREFIX, 'Hydrated via direct song page', candidate.title, candidate.artist);
+                                break;
+                            }
+                        } catch (e) {
+                            continue;
+                        }
                     }
                 }
             }
