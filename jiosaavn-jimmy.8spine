@@ -85,6 +85,7 @@ function safeDecode(value) {
 function trackVersionType(title) {
     const text = String(title || '').toLowerCase();
     if (/\(live[^)]*\)|\[live[^\]]*\]|\s[-\u2013\u2014]\s+live\b|\blive\s+at\s+\w|\blive\s+from\s+\w|\blive\s+in\s+\w/.test(text)) return 'live';
+    if (/\barrived\b|\bversion\b/.test(text)) return 'version';
     if (/\bremix\b|\(.+\s+mix\)|\s[-\u2013\u2014]\s+.+\bmix\b|\bvip\s+mix\b|\bdub\s+mix\b|\bclub\s+mix\b|\brefix\b|\bbootleg\b|\bedit\b\)|\s[-\u2013\u2014]\s+.+\b(edit|version|cut)\b/.test(text)) return 'remix';
     if (/\bacoustic\b|\bunplugged\b/.test(text)) return 'acoustic';
     if (/\bdemo\b/.test(text)) return 'demo';
@@ -238,6 +239,8 @@ function mapTrack(song) {
 // JIMMY-enabled searchTracks: applies Jimmy scoring and dedupe by default
 async function searchTracks(query, limit = 20) {
     try {
+        const intent = queryIntent(query);
+        const versionRequested = intent.wantsLive || intent.wantsRemix || intent.wantsAcoustic || intent.wantsDemo || intent.wantsInstrumental || intent.wantsCover || intent.wantsSlowed || intent.wantsSpedUp || intent.wantsNightcore || intent.wantsReverb || intent.wants8D || intent.wantsBassBoost || intent.wantsExtended;
         const response = await fetch(`${API_BASE}/result/?query=${encodeURIComponent(query)}&limit=${limit}`, { headers: REQUEST_HEADERS });
         if (!response.ok) return { tracks: [], total: 0 };
         const json = await response.json();
@@ -259,22 +262,21 @@ async function searchTracks(query, limit = 20) {
             mapped._sourceRank = index;
             mapped._relevance = queryRelevance(query, mapped.title, mapped.artist, mapped.album);
             mapped._canon = canonicityScore(mapped.title);
+            mapped._versionType = trackVersionType(mapped.title);
+            mapped._isVersion = !!mapped._versionType;
             mapped._popularity = Math.min(Math.log10(Math.max(1, mapped._playCount)) / 9, 1.0);
             return mapped;
         });
 
         // Apply Jimmy scoring and dedupe by default
-        const qualifierRegex = /\b(live|remix|cover|instrumental|slowed|sped[\s-]?up|nightcore|reverb|karaoke|lofi)\b/i;
         for (const t of tracks) {
-            t._isVersion = qualifierRegex.test(t.title);
-            t._jimmyScore = (t._canon * 0.55) + (t._relevance * 0.40) + (t._popularity * 0.05);
+            t._versionPenalty = t._isVersion && !versionRequested ? 0.95 : 0;
+            t._jimmyScore = (t._canon * 0.55) + (t._relevance * 0.40) + (t._popularity * 0.05) - t._versionPenalty;
         }
 
         const dedupMap = new Map();
-        const versions = [];
         for (const t of tracks) {
-            if (t._isVersion) { versions.push(t); continue; }
-            const baseTitle = normalize(t.title).replace(qualifierRegex, '').trim();
+            const baseTitle = stripVersionTags(t.title) || normalize(t.title);
             const artistKey = normalize(t.artist || '');
             const key = baseTitle + '||' + artistKey;
             if (!dedupMap.has(key)) dedupMap.set(key, t);
@@ -289,10 +291,14 @@ async function searchTracks(query, limit = 20) {
             }
         }
 
-        const merged = Array.from(dedupMap.values()).concat(versions);
-        merged.sort((a, b) => (b._jimmyScore || 0) - (a._jimmyScore || 0));
+        const merged = Array.from(dedupMap.values());
+        const filtered = versionRequested || !merged.some(t => !t._isVersion)
+            ? merged
+            : merged.filter(t => !t._isVersion);
+        const rankedPool = filtered.length > 0 ? filtered : merged;
+        rankedPool.sort((a, b) => (b._jimmyScore || 0) - (a._jimmyScore || 0));
 
-        const finalTracks = merged.slice(0, limit);
+        const finalTracks = rankedPool.slice(0, limit);
         return { tracks: finalTracks, total: finalTracks.length };
     } catch (error) {
         console.warn(LOG_PREFIX, 'Search error:', error);
