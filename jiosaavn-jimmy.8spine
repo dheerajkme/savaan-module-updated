@@ -15,6 +15,14 @@ const REQUEST_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
 };
 
+const DIRECT_SEARCH_HEADERS = {
+    'Accept': 'application/json',
+    'User-Agent': REQUEST_HEADERS['User-Agent'],
+    'Referer': 'https://www.jiosaavn.com/'
+};
+
+const DIRECT_API_BASE = 'https://www.jiosaavn.com/api.php';
+
 const TITLE_SIMILARITY_MIN = 0.88;
 const ARTIST_SIMILARITY_MIN = 0.70;
 
@@ -218,6 +226,52 @@ function parseEndpointPayload(json) {
     return [];
 }
 
+function parseDirectSearchResults(json) {
+    if (!json) return { total: 0, results: [] };
+    if (Array.isArray(json)) return { total: json.length, results: json };
+    const results = Array.isArray(json.results) ? json.results : [];
+    const total = parseInt(json.total, 10) || results.length || 0;
+    return { total: total, results: results };
+}
+
+async function fetchDirectSearchPage(query, page, limit) {
+    const url = DIRECT_API_BASE + '?__call=search.getResults&_format=json&_marker=0&cc=in&q=' +
+      encodeURIComponent(query) + '&p=' + String(page || 1) + '&n=' + String(limit || 20);
+        return fetchEndpointJson(url, DIRECT_SEARCH_HEADERS);
+}
+
+async function fetchDirectSearchCandidates(queries, limit) {
+    const uniqueQueries = Array.isArray(queries) ? queries : [queries];
+    const out = [];
+    const seen = {};
+    const maxPages = 3;
+
+    for (var qi = 0; qi < uniqueQueries.length; qi++) {
+        const query = String(uniqueQueries[qi] || '').trim();
+        if (!query) continue;
+
+        for (var page = 1; page <= maxPages && out.length < limit; page++) {
+            const payload = await fetchDirectSearchPage(query, page, Math.min(20, limit));
+            const parsed = parseDirectSearchResults(payload);
+            const results = parsed.results || [];
+            if (!results.length) break;
+
+            for (var i = 0; i < results.length && out.length < limit; i++) {
+                const item = results[i];
+                const mapped = mapTrack(item);
+                const key = normalize(mapped.title) + '||' + normalize(mapped.artist) + '||' + normalize(mapped.album);
+                if (seen[key]) continue;
+                seen[key] = true;
+                out.push(mapped);
+            }
+
+            if (out.length >= limit || results.length < 20) break;
+        }
+    }
+
+    return out;
+}
+
 function candidateSearchQueries(title, artist, album) {
     const out = [];
     function push(value) {
@@ -273,8 +327,8 @@ function bestTrackFromCandidates(candidates, lookupTitle, lookupArtist, lookupQu
     return chosen;
 }
 
-async function fetchEndpointJson(url) {
-    const response = await fetch(url, { headers: REQUEST_HEADERS });
+async function fetchEndpointJson(url, headers) {
+    const response = await fetch(url, { headers: headers || REQUEST_HEADERS });
     if (!response.ok) return null;
     try {
         return await response.json();
@@ -355,7 +409,6 @@ async function searchTracks(query, limit = 20) {
 
         let tracks = rawResults.map((song, index) => {
             const mapped = mapTrack(song);
-            // compute helpers
             mapped._sourceRank = index;
             mapped._relevance = queryRelevance(query, mapped.title, mapped.artist, mapped.album);
             mapped._canon = canonicityScore(mapped.title);
@@ -363,6 +416,32 @@ async function searchTracks(query, limit = 20) {
             mapped._isVersion = !!mapped._versionType;
             mapped._popularity = Math.min(Math.log10(Math.max(1, mapped._playCount)) / 9, 1.0);
             return mapped;
+        });
+
+        const directCandidates = await fetchDirectSearchCandidates(candidateSearchQueries(query, '', ''), Math.max(limit, 20));
+        if (directCandidates.length) {
+            const mergedSeen = {};
+            const mergedList = tracks.slice();
+
+            for (var d = 0; d < directCandidates.length; d++) {
+                const candidate = directCandidates[d];
+                const key = normalize(candidate.title) + '||' + normalize(candidate.artist) + '||' + normalize(candidate.album);
+                if (mergedSeen[key]) continue;
+                mergedSeen[key] = true;
+                mergedList.push(candidate);
+            }
+
+            tracks = mergedList;
+        }
+
+        // recompute helpers after merging in direct candidates
+        tracks = tracks.map(function (t) {
+            t._relevance = queryRelevance(query, t.title, t.artist, t.album);
+            t._canon = canonicityScore(t.title);
+            t._versionType = trackVersionType(t.title);
+            t._isVersion = !!t._versionType;
+            t._popularity = Math.min(Math.log10(Math.max(1, t._playCount || 0)) / 9, 1.0);
+            return t;
         });
 
         // Apply Jimmy scoring and dedupe by default
@@ -453,7 +532,19 @@ async function getTrackStreamUrl(trackId, preferredQuality, context) {
                 if (songCandidates.length) candidates = songCandidates;
             }
 
+            if (!candidates.length || !candidates.some(c => titleMatchScore(c.title, lookupTitle) >= 0.80)) {
+                const directCandidates = await fetchDirectSearchCandidates(candidateSearchQueries(lookupTitle, lookupArtist, lookupAlbum), 20);
+                if (directCandidates.length) candidates = candidates.concat(directCandidates);
+            }
+
+            candidates = candidates.filter(function (candidate, index, arr) {
+                return arr.findIndex(function (item) {
+                    return normalize(item.title) === normalize(candidate.title) && normalize(item.artist) === normalize(candidate.artist) && normalize(item.album) === normalize(candidate.album);
+                }) === index;
+            });
+
             if (candidates.length) {
+                let chosen = null;
                 // If host provided ISRC, prefer exact ISRC matches
                 const hostIsrc = (contextTrack && (contextTrack.isrc || (contextTrack.identifiers && contextTrack.identifiers.isrc))) ? String((contextTrack.isrc || contextTrack.identifiers.isrc)).toUpperCase() : null;
                 if (hostIsrc) {
