@@ -108,6 +108,16 @@ function stripVersionTags(title) {
     .trim();
 }
 
+function titleMatchScore(a, b) {
+    const aa = stripVersionTags(a || '');
+    const bb = stripVersionTags(b || '');
+    const sim = similarity(aa, bb);
+    if (!aa || !bb) return 0;
+    if (normalize(aa) === normalize(bb)) return 1;
+    if (normalize(aa).includes(normalize(bb)) || normalize(bb).includes(normalize(aa))) return Math.max(sim, 0.9);
+    return sim;
+}
+
 function isSameRecording(a, b) {
     if (!a || !b) return false;
     if (trackVersionType(a.title) !== trackVersionType(b.title)) return false;
@@ -341,15 +351,25 @@ async function getTrackStreamUrl(trackId, preferredQuality, context) {
         const lookupQuery = [lookupTitle, lookupArtist].filter(Boolean).join(' ').trim() || realId;
         let directUrl = null;
         try {
+            let candidates = [];
             const response = await fetch(`${API_BASE}/result/?query=${encodeURIComponent(lookupQuery)}&limit=10`, { headers: REQUEST_HEADERS });
             if (response.ok) {
                 const json = await response.json();
-                let candidates = parseSaavnResults(json).map(mapTrack);
-                // If the host provided an artist, prefer candidates that closely match that artist
-                if (lookupArtist) {
-                    const forced = candidates.filter(c => similarity(c.artist, lookupArtist) >= 0.80);
-                    if (forced.length) candidates = forced;
+                candidates = parseSaavnResults(json).map(mapTrack);
+            }
+            // If title+artist query produced poor title matches, retry with title-only query.
+            if (lookupTitle) {
+                const titleGood = candidates.some(c => titleMatchScore(c.title, lookupTitle) >= 0.75);
+                if (!titleGood) {
+                    const titleResp = await fetch(`${API_BASE}/result/?query=${encodeURIComponent(lookupTitle)}&limit=12`, { headers: REQUEST_HEADERS });
+                    if (titleResp.ok) {
+                        const titleJson = await titleResp.json();
+                        const titleCandidates = parseSaavnResults(titleJson).map(mapTrack);
+                        if (titleCandidates.length) candidates = titleCandidates;
+                    }
                 }
+            }
+            if (candidates.length) {
                 let chosen = null;
                 let bestScore = -1;
                 const debugList = [];
@@ -370,8 +390,14 @@ async function getTrackStreamUrl(trackId, preferredQuality, context) {
                         console.debug(LOG_PREFIX, 'Picked exact title+artist match', exact.title, exact.artist);
                     }
                 }
+                const lockedChoice = !!chosen;
+                // Hard gate: if we have a title, keep only close title matches when available.
+                if (!chosen && lookupTitle) {
+                    const titleFiltered = candidates.filter(c => titleMatchScore(c.title, lookupTitle) >= 0.75);
+                    if (titleFiltered.length) candidates = titleFiltered;
+                }
                 for (const candidate of candidates) {
-                    const titleSim = lookupTitle ? similarity(candidate.title, lookupTitle) : 0;
+                    const titleSim = lookupTitle ? titleMatchScore(candidate.title, lookupTitle) : 0;
                     const artistSim = lookupArtist ? similarity(candidate.artist, lookupArtist) : 0;
                     let score = queryRelevance(lookupQuery, candidate.title, candidate.artist, candidate.album);
                     // weight artist similarity more strongly when host provided artist
@@ -382,7 +408,7 @@ async function getTrackStreamUrl(trackId, preferredQuality, context) {
                     score += canonicityScore(candidate.title) * 0.10;
                     const durationDiff = (candidate.duration && (candidate.duration - (contextTrack && (contextTrack.duration || contextTrack.length) || 0))) || 0;
                     debugList.push({ id: candidate.id, title: candidate.title, artist: candidate.artist, titleSim: titleSim.toFixed(3), artistSim: artistSim.toFixed(3), durationDiff: durationDiff, score: score.toFixed(3) });
-                    if (!chosen && score > bestScore) {
+                    if (!lockedChoice && score > bestScore) {
                         bestScore = score;
                         chosen = candidate;
                     }
@@ -397,6 +423,19 @@ async function getTrackStreamUrl(trackId, preferredQuality, context) {
                             console.debug(LOG_PREFIX, 'Switched to higher-artist-sim candidate', alt.title, alt.artist);
                             chosen = alt;
                         }
+                    }
+                }
+                // Confidence gate: do not play a random mismatch if title similarity is weak.
+                if (chosen && lookupTitle) {
+                    const ts = titleMatchScore(chosen.title, lookupTitle);
+                    if (ts < 0.70) {
+                        throw new Error('No confident title match found for stream resolution');
+                    }
+                }
+                if (chosen && lookupArtist) {
+                    const as = similarity(chosen.artist, lookupArtist);
+                    if (as < 0.60) {
+                        throw new Error('No confident artist match found for stream resolution');
                     }
                 }
                 if (chosen && chosen._raw) {
