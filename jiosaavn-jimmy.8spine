@@ -572,7 +572,7 @@ async function getTrackStreamUrl(trackId, preferredQuality, context) {
     } catch (error) {
         throw error;
     }
-
+}
 async function getAlbum(albumId) { throw new Error('Album fetch not supported yet'); }
 async function getArtist(artistId) { throw new Error('Artist fetch not supported yet'); }
 async function getLyrics(trackId) { return null; }
