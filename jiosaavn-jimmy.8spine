@@ -491,8 +491,8 @@ async function hydrateMediaUrl(permaOrId) {
         if (typeof details === 'object') {
             for (const k of Object.keys(details)) {
                 const t = details[k];
-                if (t && (t.media_preview_url || t.media_url || t.url)) {
-                    return String(t.media_preview_url || t.media_url || t.url).replace('96_p', '320_p');
+                if (t && (t.media_url || t.url || t.media_preview_url)) {
+                    return String(t.media_url || t.url || t.media_preview_url).replace('96_p', '320_p');
                 }
             }
         }
