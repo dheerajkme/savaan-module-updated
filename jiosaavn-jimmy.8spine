@@ -499,17 +499,35 @@ async function hydrateMediaUrl(permaOrId) {
         return null;
     }
 
-    // otherwise assume it's a song id and call the direct JioSaavn endpoint
-    const url = `${DIRECT_API_BASE}?__call=song.getDetails&_format=json&_marker=0&cc=in&pids=${encodeURIComponent(permaOrId)}`;
-    const details = await fetchEndpointJson(url, DIRECT_SEARCH_HEADERS);
-    if (!details) return null;
-    const entry = details[permaOrId] || (details[0] && details[0][permaOrId]) || null;
-    if (entry) {
-        const media = entry.media_preview_url || entry.media_url || entry.url || '';
-        if (media) return String(media).replace('96_p', '320_p');
-        if (Array.isArray(entry.downloadUrl) && entry.downloadUrl.length) {
-            return entry.downloadUrl[entry.downloadUrl.length - 1].url || entry.downloadUrl[entry.downloadUrl.length - 1].link || null;
+    // Otherwise treat the value as an id and query the wrapper API for a playable URL.
+    // IMPORTANT: do not use the direct JioSaavn song.getDetails response for streaming
+    // because it may only provide preview URLs. The wrapper (`API_BASE`) returns
+    // full playable URLs when available.
+    try {
+        const details = await fetchEndpointJson(`${API_BASE}/song/?query=${encodeURIComponent(permaOrId)}`, REQUEST_HEADERS);
+        if (!details) return null;
+        // details may be an object or array or a map of pid->obj
+        if (details.media_url) return details.media_url;
+        if (details.url) return details.url;
+        if (Array.isArray(details.downloadUrl) && details.downloadUrl.length) {
+            const last = details.downloadUrl[details.downloadUrl.length - 1];
+            return last && (last.url || last.link) || null;
         }
+        if (typeof details === 'object') {
+            // try to find a playable entry inside the payload
+            for (const k of Object.keys(details)) {
+                const t = details[k];
+                if (!t) continue;
+                const media = t.media_url || t.url || t.media_preview_url;
+                if (media) return String(media).replace('96_p', '320_p');
+                if (Array.isArray(t.downloadUrl) && t.downloadUrl.length) {
+                    const last = t.downloadUrl[t.downloadUrl.length - 1];
+                    if (last && (last.url || last.link)) return last.url || last.link;
+                }
+            }
+        }
+    } catch (e) {
+        return null;
     }
     return null;
 }
@@ -561,28 +579,10 @@ async function searchTracks(query, limit = 20, context) {
         const versionRequested = intent.wantsLive || intent.wantsRemix || intent.wantsAcoustic || intent.wantsDemo || intent.wantsInstrumental || intent.wantsCover || intent.wantsSlowed || intent.wantsSpedUp || intent.wantsNightcore || intent.wantsReverb || intent.wants8D || intent.wantsBassBoost || intent.wantsExtended;
         let tracks = await fetchDirectSearchCandidates(candidateSearchQueries(query, '', ''), Math.max(limit, 20));
 
-        if (!tracks.length) {
-            const response = await fetch(`${API_BASE}/result/?query=${encodeURIComponent(query)}&limit=${limit}`, { headers: REQUEST_HEADERS });
-            if (response.ok) {
-                const json = await response.json();
-                let rawResults = [];
-                if (Array.isArray(json)) {
-                    rawResults = json;
-                } else if (json.success && json.data) {
-                    rawResults = json.data.results || json.data.songs || json.data || [];
-                } else {
-                    rawResults = json.songs || json.results || [];
-                }
-
-                if (Array.isArray(rawResults) && rawResults.length > 0) {
-                    tracks = rawResults.map((song, index) => {
-                        const mapped = mapTrack(song);
-                        mapped._sourceRank = index;
-                        return mapped;
-                    });
-                }
-            }
-        }
+        // Per architecture: use the original JioSaavn endpoint only for search/discovery.
+        // If direct search returns nothing, return an empty result rather than falling
+        // back to the wrapper API which only provides playable URLs.
+        if (!tracks.length) return { tracks: [], total: 0 };
 
         if (!Array.isArray(tracks) || tracks.length === 0) return { tracks: [], total: 0 };
 
