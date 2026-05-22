@@ -66,6 +66,7 @@ function queryRelevance(query, title, artist, album) {
     if (hits < qTokens.length) base = base * 0.3; 
     if (similarity(query, normalize(artist || '')) > 0.80) base = Math.min(1.3, base + 0.30);
     if (similarity(query, normalize(title || '')) > 0.80) base = Math.min(1.3, base + 0.30);
+    if (album && similarity(query, normalize(album || '')) > 0.80) base = Math.min(1.3, base + 0.40);
     return base;
 }
 
@@ -404,63 +405,51 @@ function mapTrack(song) {
     return result;
 }
 
-// JIMMY-enabled searchTracks: applies Jimmy scoring and dedupe by default
-async function searchTracks(query, limit = 20) {
+async function searchTracks(query, limit = 20, context) {
     try {
+        const useDirect = true; // Forcing direct search
         const intent = queryIntent(query);
         const versionRequested = intent.wantsLive || intent.wantsRemix || intent.wantsAcoustic || intent.wantsDemo || intent.wantsInstrumental || intent.wantsCover || intent.wantsSlowed || intent.wantsSpedUp || intent.wantsNightcore || intent.wantsReverb || intent.wants8D || intent.wantsBassBoost || intent.wantsExtended;
-        const response = await fetch(`${API_BASE}/result/?query=${encodeURIComponent(query)}&limit=${limit}`, { headers: REQUEST_HEADERS });
-        if (!response.ok) return { tracks: [], total: 0 };
-        const json = await response.json();
+        
+        let tracks = [];
 
-        let rawResults = [];
-        if (Array.isArray(json)) {
-            rawResults = json;
-        } else if (json.success && json.data) {
-            rawResults = json.data.results || json.data.songs || json.data || [];
+        if (useDirect) {
+            const directCandidates = await fetchDirectSearchCandidates(candidateSearchQueries(query, '', ''), Math.max(limit, 20));
+            tracks = directCandidates.map(t => {
+                t._relevance = queryRelevance(query, t.title, t.artist, t.album);
+                t._canon = canonicityScore(t.title);
+                t._versionType = trackVersionType(t.title);
+                t._isVersion = !!t._versionType;
+                t._popularity = Math.min(Math.log10(Math.max(1, t._playCount || 0)) / 9, 1.0);
+                return t;
+            });
         } else {
-            rawResults = json.songs || json.results || [];
-        }
+            const response = await fetch(`${API_BASE}/result/?query=${encodeURIComponent(query)}&limit=${limit}`, { headers: REQUEST_HEADERS });
+            if (!response.ok) return { tracks: [], total: 0 };
+            const json = await response.json();
 
-        if (!Array.isArray(rawResults) || rawResults.length === 0) return { tracks: [], total: 0 };
-
-        let tracks = rawResults.map((song, index) => {
-            const mapped = mapTrack(song);
-            mapped._sourceRank = index;
-            mapped._relevance = queryRelevance(query, mapped.title, mapped.artist, mapped.album);
-            mapped._canon = canonicityScore(mapped.title);
-            mapped._versionType = trackVersionType(mapped.title);
-            mapped._isVersion = !!mapped._versionType;
-            mapped._popularity = Math.min(Math.log10(Math.max(1, mapped._playCount)) / 9, 1.0);
-            return mapped;
-        });
-
-        const directCandidates = await fetchDirectSearchCandidates(candidateSearchQueries(query, '', ''), Math.max(limit, 20));
-        if (directCandidates.length) {
-            const mergedSeen = {};
-            const mergedList = tracks.slice();
-
-            for (var d = 0; d < directCandidates.length; d++) {
-                const candidate = directCandidates[d];
-                candidate._source = candidate._source || 'direct';
-                const key = normalize(candidate.title) + '||' + normalize(candidate.artist) + '||' + normalize(candidate.album);
-                if (mergedSeen[key]) continue;
-                mergedSeen[key] = true;
-                mergedList.push(candidate);
+            let rawResults = [];
+            if (Array.isArray(json)) {
+                rawResults = json;
+            } else if (json.success && json.data) {
+                rawResults = json.data.results || json.data.songs || json.data || [];
+            } else {
+                rawResults = json.songs || json.results || [];
             }
 
-            tracks = mergedList;
-        }
+            if (!Array.isArray(rawResults) || rawResults.length === 0) return { tracks: [], total: 0 };
 
-        // recompute helpers after merging in direct candidates
-        tracks = tracks.map(function (t) {
-            t._relevance = queryRelevance(query, t.title, t.artist, t.album);
-            t._canon = canonicityScore(t.title);
-            t._versionType = trackVersionType(t.title);
-            t._isVersion = !!t._versionType;
-            t._popularity = Math.min(Math.log10(Math.max(1, t._playCount || 0)) / 9, 1.0);
-            return t;
-        });
+            tracks = rawResults.map((song, index) => {
+                const mapped = mapTrack(song);
+                mapped._sourceRank = index;
+                mapped._relevance = queryRelevance(query, mapped.title, mapped.artist, mapped.album);
+                mapped._canon = canonicityScore(mapped.title);
+                mapped._versionType = trackVersionType(mapped.title);
+                mapped._isVersion = !!mapped._versionType;
+                mapped._popularity = Math.min(Math.log10(Math.max(1, mapped._playCount)) / 9, 1.0);
+                return mapped;
+            });
+        }
 
         // Apply Jimmy scoring and dedupe by default
         for (const t of tracks) {
@@ -512,144 +501,64 @@ async function getTrackStreamUrl(trackId, preferredQuality, context) {
 
         const parts = String(trackId).split('||');
         const realId = parts[0];
-        const embeddedUrl = parts.length > 1 ? parts[1] : null;
         const encodedTitle = parts.length > 2 ? parts[2] : '';
         const encodedArtist = parts.length > 3 ? parts[3] : '';
-        const idTitle = encodedTitle ? decodeURIComponent(encodedTitle) : '';
-        const idArtist = encodedArtist ? decodeURIComponent(encodedArtist) : '';
+        const idTitle = encodedTitle ? safeDecode(encodedTitle) : '';
+        const idArtist = encodedArtist ? safeDecode(encodedArtist) : '';
         const contextTrack = context && (context.track || context);
         const lookupTitle = (contextTrack && (contextTrack.title || contextTrack.song || contextTrack.name)) || idTitle;
         const lookupArtist = (contextTrack && (contextTrack.artist || contextTrack.primary_artists || contextTrack.primaryArtists)) || idArtist;
         const lookupAlbum = contextTrack && (contextTrack.album || contextTrack.albumTitle || contextTrack.album_name) || '';
         const lookupQuery = [lookupTitle, lookupArtist].filter(Boolean).join(' ').trim() || realId;
+        
         let directUrl = null;
+        
         try {
-            let candidates = [];
             const queries = candidateSearchQueries(lookupTitle, lookupArtist, lookupAlbum);
-            for (const q of queries) {
-                const payload = await fetchEndpointJson(`${API_BASE}/result/?query=${encodeURIComponent(q)}&limit=10`);
-                if (!payload) continue;
-                const nextCandidates = parseSaavnResults(payload).map(mapTrack);
-                if (!nextCandidates.length) continue;
-                candidates = candidates.concat(nextCandidates);
-                const hasStrongTitle = lookupTitle && nextCandidates.some(c => titleMatchScore(c.title, lookupTitle) >= 0.80);
-                const hasStrongArtist = lookupArtist && nextCandidates.some(c => similarity(c.artist, lookupArtist) >= 0.80);
-                if (hasStrongTitle && (!lookupArtist || hasStrongArtist)) break;
-            }
-
-            candidates = candidates.filter(function (candidate, index, arr) {
-                return arr.findIndex(function (item) {
-                    return normalize(item.title) === normalize(candidate.title) && normalize(item.artist) === normalize(candidate.artist) && normalize(item.album) === normalize(candidate.album);
-                }) === index;
-            });
-
-            // If API search misses the exact song but we have a song URL, hydrate via /song.
-            const hasStrongWrapperCandidate = candidates.some(function (candidate) {
-                const titleOk = titleMatchScore(candidate.title, lookupTitle) >= 0.80;
-                const artistOk = !lookupArtist || similarity(candidate.artist, lookupArtist) >= 0.60;
-                return titleOk && artistOk;
-            });
-
-            if ((!candidates.length || !hasStrongWrapperCandidate) && realId && realId.indexOf('http') === 0) {
-                const songPayload = await fetchEndpointJson(`${API_BASE}/song/?query=${encodeURIComponent(realId)}`);
-                const songCandidates = parseEndpointPayload(songPayload).map(mapTrack);
-                if (songCandidates.length) candidates = songCandidates;
-            }
-
-            if (!candidates.length || !hasStrongWrapperCandidate) {
-                const directCandidates = await fetchDirectSearchCandidates(candidateSearchQueries(lookupTitle, lookupArtist, lookupAlbum), 20);
-                if (directCandidates.length) candidates = candidates.concat(directCandidates);
-            }
-
-            candidates = candidates.filter(function (candidate, index, arr) {
-                return arr.findIndex(function (item) {
-                    return normalize(item.title) === normalize(candidate.title) && normalize(item.artist) === normalize(candidate.artist) && normalize(item.album) === normalize(candidate.album);
-                }) === index;
-            });
+            const candidates = await fetchDirectSearchCandidates(queries, 20);
 
             if (candidates.length) {
                 let chosen = null;
-                // If host provided ISRC, prefer exact ISRC matches
                 const hostIsrc = (contextTrack && (contextTrack.isrc || (contextTrack.identifiers && contextTrack.identifiers.isrc))) ? String((contextTrack.isrc || contextTrack.identifiers.isrc)).toUpperCase() : null;
                 if (hostIsrc) {
                     const matchByIsrc = candidates.find(c => c.isrc && String(c.isrc).toUpperCase() === hostIsrc);
                     if (matchByIsrc) {
                         chosen = matchByIsrc;
-                        console.debug(LOG_PREFIX, 'Picked by ISRC match', hostIsrc, chosen.title, chosen.artist);
                     }
                 }
-                // If exact normalized title+artist exists, pick immediately
+                
                 if (!chosen && lookupTitle && lookupArtist) {
                     const exact = candidates.find(c => normalize(c.title) === normalize(lookupTitle) && normalize(c.artist) === normalize(lookupArtist));
                     if (exact) {
                         chosen = exact;
-                        console.debug(LOG_PREFIX, 'Picked exact title+artist match', exact.title, exact.artist);
                     }
                 }
+
                 if (!chosen) {
                     const titleFiltered = lookupTitle ? candidates.filter(c => titleMatchScore(c.title, lookupTitle) >= 0.70) : candidates;
                     const scored = titleFiltered.length ? titleFiltered : candidates;
                     chosen = bestTrackFromCandidates(scored, lookupTitle, lookupArtist, lookupQuery);
                 }
-                // final guard: prefer a very high artistSim candidate if chosen has low artistSim
-                if (chosen && lookupArtist) {
-                    const chosenArtistSim = similarity(chosen.artist, lookupArtist);
-                    if (chosenArtistSim < 0.75) {
-                        const alt = candidates.find(c => similarity(c.artist, lookupArtist) >= 0.90);
-                        if (alt) {
-                            console.debug(LOG_PREFIX, 'Switched to higher-artist-sim candidate', alt.title, alt.artist);
-                            chosen = alt;
-                        }
-                    }
+
+                if (chosen && lookupTitle && titleMatchScore(chosen.title, lookupTitle) < 0.70) {
+                     throw new Error('No confident title match found for stream resolution');
                 }
-                // Confidence gate: do not play a random mismatch if title similarity is weak.
-                if (chosen && lookupTitle) {
-                    const ts = titleMatchScore(chosen.title, lookupTitle);
-                    if (ts < 0.70) {
-                        throw new Error('No confident title match found for stream resolution');
-                    }
+                if (chosen && lookupArtist && similarity(chosen.artist, lookupArtist) < 0.60) {
+                    throw new Error('No confident artist match found for stream resolution');
                 }
-                if (chosen && lookupArtist && chosen._source !== 'direct') {
-                    const as = similarity(chosen.artist, lookupArtist);
-                    if (as < 0.60) {
-                        throw new Error('No confident artist match found for stream resolution');
-                    }
-                }
+
                 if (chosen && chosen._raw) {
                     directUrl = chosen._raw.media_url || chosen._raw.url || '';
                     if (!directUrl && Array.isArray(chosen._raw.downloadUrl)) {
                         directUrl = chosen._raw.downloadUrl[chosen._raw.downloadUrl.length - 1].url || chosen._raw.downloadUrl[chosen._raw.downloadUrl.length - 1].link || '';
                     }
-                    if (!directUrl && chosen._raw.perma_url) {
-                        try { directUrl = await hydrateMediaUrl(chosen._raw.perma_url); } catch (e) {}
-                    }
                     if (!directUrl && chosen.sourceId && String(chosen.sourceId).indexOf('http') === 0) {
                         try { directUrl = await hydrateMediaUrl(chosen.sourceId); } catch (e) {}
-                    }
-                }
-
-                if (!directUrl) {
-                    for (const candidate of candidates) {
-                        const perma = candidate && candidate._raw && candidate._raw.perma_url;
-                        if (!perma) continue;
-                        try {
-                            directUrl = await hydrateMediaUrl(perma);
-                            if (directUrl) {
-                                console.debug(LOG_PREFIX, 'Hydrated via direct song page', candidate.title, candidate.artist);
-                                break;
-                            }
-                        } catch (e) {
-                            continue;
-                        }
                     }
                 }
             }
         } catch (lookupError) {
             directUrl = null;
-        }
-
-        if (!directUrl || directUrl === 'undefined' || directUrl === '') {
-            directUrl = embeddedUrl;
         }
 
         if (directUrl) {
@@ -663,7 +572,6 @@ async function getTrackStreamUrl(trackId, preferredQuality, context) {
     } catch (error) {
         throw error;
     }
-}
 
 async function getAlbum(albumId) { throw new Error('Album fetch not supported yet'); }
 async function getArtist(artistId) { throw new Error('Artist fetch not supported yet'); }
