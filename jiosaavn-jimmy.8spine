@@ -88,90 +88,7 @@ function htmlDecode(input) {
     return input.replace(/&quot;/g, '"').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
 }
 
-function extractBestImage(imageObj) {
-    if (Array.isArray(imageObj) && imageObj.length > 0) return imageObj[imageObj.length - 1].url || imageObj[imageObj.length - 1].link || '';
-    if (typeof imageObj === 'string') return imageObj;
-    return '';
-}
-
-function safeDecode(value) {
-//... existing code...
-        return await response.json();
-    } catch (error) {
-        return null;
-    }
-}
-
-async function hydrateMediaUrl(songId) {
-    if (!songId) return null;
-    const url = `${DIRECT_API_BASE}?__call=song.getDetails&_format=json&_marker=0&cc=in&pids=${songId}`;
-    const details = await fetchEndpointJson(url, DIRECT_SEARCH_HEADERS);
-    if (!details || !details[songId]) return null;
-    const track = details[songId];
-    const mediaUrl = track.media_preview_url || '';
-    if (!mediaUrl) return null;
-    return mediaUrl.replace('96_p', '320_p');
-}
-
-function mapTrack(song) {
-    const bestImage = extractBestImage(song.image || song.image_url || song.thumbnail || '');
-    
-    let artistName = 'Unknown Artist';
-    if (song.primary_artists) {
-        artistName = song.primary_artists;
-    } else if (song.more_info && song.more_info.artistMap && song.more_info.artistMap.primary_artists) {
-        artistName = song.more_info.artistMap.primary_artists.map(a => a.name).join(', ');
-    } else if (song.artists && Array.isArray(song.artists.primary) && song.artists.primary.length > 0) {
-        artistName = song.artists.primary.map(a => a.name).join(', ');
-    } else if (typeof song.primaryArtists === 'string') {
-        artistName = song.primaryArtists;
-    } else if (Array.isArray(song.primaryArtists)) {
-        artistName = song.primaryArtists.map(a => a.name).join(', ');
-    }
-
-    const title = htmlDecode(song.song || song.name || song.title || 'Unknown Title');
-    const albumName = htmlDecode((song.album && song.album.name) ? song.album.name : (typeof song.album === 'string' ? song.album : 'Unknown Album'));
-    const trackId = String(song.id || song.songid || song.vcode || '');
-
-    const result = {
-        id: trackId,
-        title: title,
-        artist: artistName,
-        album: albumName,
-        albumCover: bestImage.replace('150x150', '500x500'),
-        duration: parseInt(song.duration) || 0,
-        audioQuality: 'HIGH',
-        _playCount: parseInt(song.play_count) || parseInt(song.playCount) || 0,
-        _raw: song,
-        isrc: song.isrc || (song.more_info && song.more_info.isrc) || null
-    };
-    return result;
-}
-
-async function searchTracks(query, limit = 20, context) {
-//... existing code...
-    }
-}
-
-async function getTrackStreamUrl(trackId, preferredQuality, context) {
-    try {
-        const streamUrl = await hydrateMediaUrl(trackId);
-        if (streamUrl) {
-            return {
-                streamUrl: streamUrl,
-                streamType: 'mp4',
-                track: { id: trackId, audioQuality: 'HIGH' }
-            };
-        }
-        throw new Error('No audio URL found for track ' + trackId);
-    } catch (error) {
-        console.error(LOG_PREFIX, 'getTrackStreamUrl error:', error);
-        throw error;
-    }
-}
-async function getAlbum(albumId) { throw new Error('Album fetch not supported yet'); }
-async function getArtist(artistId) { throw new Error('Artist fetch not supported yet'); }
-async function getLyrics(trackId) { return null; }
+// helper section completed
 
 function extractBestImage(imageObj) {
     if (Array.isArray(imageObj) && imageObj.length > 0) return imageObj[imageObj.length - 1].url || imageObj[imageObj.length - 1].link || '';
@@ -336,16 +253,20 @@ async function fetchDirectSearchCandidates(queries, limit) {
     const out = [];
     const seen = {};
     const maxPages = 3;
+    const pageSize = Math.min(20, Math.max(1, limit || 20));
 
     for (var qi = 0; qi < uniqueQueries.length; qi++) {
         const query = String(uniqueQueries[qi] || '').trim();
         if (!query) continue;
+        let fetched = 0;
 
         for (var page = 1; page <= maxPages && out.length < limit; page++) {
-            const payload = await fetchDirectSearchPage(query, page, Math.min(20, limit));
+            const payload = await fetchDirectSearchPage(query, page, pageSize);
             const parsed = parseDirectSearchResults(payload);
             const results = parsed.results || [];
             if (!results.length) break;
+
+            fetched += results.length;
 
             for (var i = 0; i < results.length && out.length < limit; i++) {
                 const item = results[i];
@@ -357,7 +278,9 @@ async function fetchDirectSearchCandidates(queries, limit) {
                 out.push(mapped);
             }
 
-            if (out.length >= limit || results.length < 20) break;
+            if (out.length >= limit) break;
+            if (results.length < pageSize) break;
+            if (parsed.total && fetched >= parsed.total) break;
         }
     }
 
@@ -382,30 +305,152 @@ function candidateSearchQueries(title, artist, album) {
     if (strippedTitle && strippedTitle !== title) {
         push(strippedTitle);
         push([strippedTitle, artist].filter(Boolean).join(' '));
+        push([strippedTitle, artist, album].filter(Boolean).join(' '));
+    }
+
+    if (artist) {
+        push([artist, title].filter(Boolean).join(' '));
+    }
+
+    if (album) {
+        push([title, album].filter(Boolean).join(' '));
+        push([artist, album].filter(Boolean).join(' '));
     }
 
     return out;
 }
 
-function bestTrackFromCandidates(candidates, lookupTitle, lookupArtist, lookupQuery) {
+function splitArtistNames(value) {
+    return String(value || '')
+        .split(/\s*(?:,|&|\+|\/|\band\b|\bwith\b|\bfeat(?:uring)?\.?\b|\bvs\.?\b|\bx\b)\s*/i)
+        .map(function (part) { return normalize(part); })
+        .filter(Boolean);
+}
+
+function artistSimilarityScore(a, b) {
+    var left = normalize(a);
+    var right = normalize(b);
+    if (!left || !right) return 0;
+    if (left === right) return 1;
+
+    var direct = similarity(left, right);
+    var leftParts = splitArtistNames(a);
+    var rightParts = splitArtistNames(b);
+    var bestParts = 0;
+
+    for (var i = 0; i < leftParts.length; i++) {
+        for (var j = 0; j < rightParts.length; j++) {
+            var pairSim = similarity(leftParts[i], rightParts[j]);
+            if (pairSim > bestParts) bestParts = pairSim;
+        }
+    }
+
+    var coverage = 0;
+    if (leftParts.length && rightParts.length) {
+        var matched = 0;
+        for (var k = 0; k < leftParts.length; k++) {
+            var partBest = 0;
+            for (var m = 0; m < rightParts.length; m++) {
+                var candidate = similarity(leftParts[k], rightParts[m]);
+                if (candidate > partBest) partBest = candidate;
+            }
+            if (partBest >= 0.80) matched++;
+        }
+        coverage = matched / Math.max(leftParts.length, rightParts.length);
+    }
+
+    return Math.max(direct, (bestParts * 0.75) + (coverage * 0.25));
+}
+
+function albumSimilarityScore(a, b) {
+    var left = normalize(a);
+    var right = normalize(b);
+    if (!left || !right) return 0;
+    if (left === right) return 1;
+    return similarity(left, right);
+}
+
+function scorePlaybackCandidate(candidate, meta, intent) {
+    if (!candidate || !meta) return -1;
+
+    var lookupTitle = stripVersionTags(meta.title || '');
+    var lookupArtist = String(meta.artist || '');
+    var lookupAlbum = String(meta.album || '');
+    var titleSim = lookupTitle ? titleMatchScore(candidate.title, lookupTitle) : 0;
+    var artistSim = lookupArtist ? artistSimilarityScore(candidate.artist, lookupArtist) : 0;
+    var albumSim = lookupAlbum ? albumSimilarityScore(candidate.album, lookupAlbum) : 0;
+    var candidateType = trackVersionType(candidate.title);
+    var requestedType = trackVersionType(meta.title || '');
+
+    if (lookupTitle && titleSim < 0.78) return -1;
+    if (lookupArtist && artistSim < 0.68) return -1;
+    if (lookupAlbum && albumSim < 0.45 && /soundtrack|original motion picture|ost/i.test(lookupAlbum)) return -1;
+    if (requestedType && candidateType && requestedType !== candidateType) return -1;
+
+    var titleExact = normalize(stripVersionTags(candidate.title || '')) === normalize(lookupTitle);
+    var artistExact = normalize(candidate.artist || '') === normalize(lookupArtist);
+    var albumExact = lookupAlbum && normalize(candidate.album || '') === normalize(lookupAlbum);
+    var score = (titleSim * 0.48) + (artistSim * 0.32) + (albumSim * 0.12) + (canonicityScoreJimmy(candidate, intent) * 0.08);
+
+    if (titleExact) score += 0.18;
+    if (artistExact) score += 0.14;
+    if (albumExact) score += 0.08;
+    if (lookupAlbum && albumSim >= 0.80) score += 0.08;
+    if (lookupArtist && artistSim >= 0.90) score += 0.08;
+    if (candidateType && !requestedType) score -= 0.10;
+    if (requestedType && !candidateType) score -= 0.05;
+    if (lookupTitle && !titleExact && /\b(full song|full video|official video|video song|lyric video|from\b)/i.test(String(candidate.title || ''))) score -= 0.10;
+
+    return score;
+}
+
+function scoreSearchCandidate(candidate, query) {
+    if (!candidate) return -1;
+    var intent = queryIntent(query);
+    var queryTitle = stripVersionTags(query || '');
+    var titleSim = queryTitle ? titleMatchScore(candidate.title, queryTitle) : 0;
+    var artistSim = query ? similarity(candidate.artist, query) : 0;
+    var base = queryRelevance(query, candidate.title, candidate.artist, candidate.album);
+    var score = (base * 0.45) + (titleSim * 0.30) + (artistSim * 0.15) + (canonicityScoreJimmy(candidate, intent) * 0.10);
+
+    if (normalize(stripVersionTags(candidate.title || '')) === normalize(queryTitle)) score += 0.18;
+    if (titleSim >= 0.90) score += 0.08;
+    if (artistSim >= 0.85) score += 0.08;
+    return score;
+}
+
+function dedupeTrackCandidates(tracks) {
+    var seen = {};
+    var out = [];
+    for (var i = 0; i < tracks.length; i++) {
+        var t = tracks[i];
+        if (!t) continue;
+        var key = normalize(stripVersionTags(t.title || '')) + '||' + normalize(t.artist || '') + '||' + normalize(t.album || '');
+        if (seen[key]) continue;
+        seen[key] = true;
+        out.push(t);
+    }
+    return out;
+}
+
+function bestTrackFromCandidates(candidates, meta, lookupQuery) {
     let chosen = null;
     let bestScore = -1;
     const debugList = [];
 
     for (const candidate of candidates) {
-        const titleSim = lookupTitle ? titleMatchScore(candidate.title, lookupTitle) : 0;
-        const artistSim = lookupArtist ? similarity(candidate.artist, lookupArtist) : 0;
-        let score = queryRelevance(lookupQuery, candidate.title, candidate.artist, candidate.album);
-        if (lookupArtist) score += artistSim * 0.5;
-        if (lookupTitle && normalize(candidate.title) === normalize(lookupTitle)) score += 0.5;
-        if (lookupArtist && normalize(candidate.artist) === normalize(lookupArtist)) score += 0.35;
-        score += canonicityScore(candidate.title) * 0.10;
+        const titleSim = meta && meta.title ? titleMatchScore(candidate.title, meta.title) : 0;
+        const artistSim = meta && meta.artist ? artistSimilarityScore(candidate.artist, meta.artist) : 0;
+        const albumSim = meta && meta.album ? albumSimilarityScore(candidate.album, meta.album) : 0;
+        let score = scorePlaybackCandidate(candidate, meta, queryIntent(lookupQuery));
         debugList.push({
             id: candidate.id,
             title: candidate.title,
             artist: candidate.artist,
+            album: candidate.album,
             titleSim: titleSim.toFixed(3),
             artistSim: artistSim.toFixed(3),
+            albumSim: albumSim.toFixed(3),
             score: score.toFixed(3)
         });
 
@@ -429,65 +474,80 @@ async function fetchEndpointJson(url, headers) {
     }
 }
 
-async function hydrateMediaUrl(permaUrl) {
-    if (!permaUrl) return null;
-    const details = await fetchEndpointJson(
-        `${API_BASE}/song/?query=${encodeURIComponent(permaUrl)}`,
-        REQUEST_HEADERS
-    );
+// Unified hydrate + mapping helpers
+async function hydrateMediaUrl(permaOrId) {
+    if (!permaOrId) return null;
+    // if looks like a URL, try the API_BASE song lookup first
+    if (/^https?:\/\//i.test(String(permaOrId))) {
+        const details = await fetchEndpointJson(`${API_BASE}/song/?query=${encodeURIComponent(permaOrId)}`, REQUEST_HEADERS);
+        if (!details) return null;
+        if (details.media_url) return details.media_url;
+        if (details.url) return details.url;
+        if (Array.isArray(details.downloadUrl) && details.downloadUrl.length) {
+            const last = details.downloadUrl[details.downloadUrl.length - 1];
+            return last && (last.url || last.link) || null;
+        }
+        // some responses return a map of pid->obj
+        if (typeof details === 'object') {
+            for (const k of Object.keys(details)) {
+                const t = details[k];
+                if (t && (t.media_preview_url || t.media_url || t.url)) {
+                    return String(t.media_preview_url || t.media_url || t.url).replace('96_p', '320_p');
+                }
+            }
+        }
+        return null;
+    }
+
+    // otherwise assume it's a song id and call the direct JioSaavn endpoint
+    const url = `${DIRECT_API_BASE}?__call=song.getDetails&_format=json&_marker=0&cc=in&pids=${encodeURIComponent(permaOrId)}`;
+    const details = await fetchEndpointJson(url, DIRECT_SEARCH_HEADERS);
     if (!details) return null;
-    if (details.media_url) return details.media_url;
-    if (details.url) return details.url;
-    if (Array.isArray(details.downloadUrl) && details.downloadUrl.length) {
-        const last = details.downloadUrl[details.downloadUrl.length - 1];
-        return last && (last.url || last.link) || null;
+    const entry = details[permaOrId] || (details[0] && details[0][permaOrId]) || null;
+    if (entry) {
+        const media = entry.media_preview_url || entry.media_url || entry.url || '';
+        if (media) return String(media).replace('96_p', '320_p');
+        if (Array.isArray(entry.downloadUrl) && entry.downloadUrl.length) {
+            return entry.downloadUrl[entry.downloadUrl.length - 1].url || entry.downloadUrl[entry.downloadUrl.length - 1].link || null;
+        }
     }
     return null;
 }
 
 function mapTrack(song) {
-    const bestImage = extractBestImage(song.image || song.image_url || song.thumbnail || '');
-    let bestAudio = song.media_url || song.url || '';
-    if (Array.isArray(song.downloadUrl) && song.downloadUrl.length > 0) {
-        bestAudio = song.downloadUrl[song.downloadUrl.length - 1].url || song.downloadUrl[song.downloadUrl.length - 1].link || '';
-    }
+    const bestImage = extractBestImage(song.image || song.image_url || song.thumbnail || song.album && song.album.image || '');
 
     let artistName = 'Unknown Artist';
-    let artistId = null;
     if (song.primary_artists) {
-        artistName = song.primary_artists;
+        artistName = htmlDecode(song.primary_artists);
+    } else if (song.more_info && song.more_info.artistMap && Array.isArray(song.more_info.artistMap.primary_artists)) {
+        artistName = song.more_info.artistMap.primary_artists.map(a => a.name).join(', ');
     } else if (song.artists && Array.isArray(song.artists.primary) && song.artists.primary.length > 0) {
         artistName = song.artists.primary.map(a => a.name).join(', ');
-        artistId = String(song.artists.primary[0].id || song.artists.primary[0].pid || '');
     } else if (typeof song.primaryArtists === 'string') {
         artistName = song.primaryArtists;
     } else if (Array.isArray(song.primaryArtists)) {
         artistName = song.primaryArtists.map(a => a.name).join(', ');
-        if (song.primaryArtists.length > 0) artistId = String(song.primaryArtists[0].id || song.primaryArtists[0].pid || '');
+    } else if (song.more_info && song.more_info.singers) {
+        artistName = song.more_info.singers;
     }
 
-    const title = song.song || song.name || song.title || 'Unknown Title';
-    const albumName = (song.album && song.album.name) ? song.album.name : (typeof song.album === 'string' ? song.album : 'Unknown Album');
-    const albumId = (song.album && (song.album.id || song.album.albumid)) ? String(song.album.id || song.album.albumid) : null;
-    const rawId = song.perma_url || song.id || song.songid || song.vcode || '';
-    const compoundId = [String(rawId), bestAudio || '', encodeURIComponent(title), encodeURIComponent(artistName)].join('||');
-    const trackId = bestAudio || compoundId;
+    const title = htmlDecode(song.song || song.name || song.title || 'Unknown Title');
+    const albumName = htmlDecode((song.album && song.album.name) ? song.album.name : (typeof song.album === 'string' ? song.album : 'Unknown Album'));
+    const trackId = String(song.id || song.songid || song.vcode || song.perma_url || '');
 
     const result = {
         id: trackId,
-        sourceId: rawId,
+        sourceId: song.perma_url || song.id || song.songid || song.vcode || null,
         title: title,
         artist: artistName,
-        artistId: artistId,
         album: albumName,
-        albumId: albumId,
-        albumCover: bestImage,
+        albumCover: bestImage ? String(bestImage).replace('150x150', '500x500') : '',
         duration: parseInt(song.duration) || 0,
         audioQuality: 'HIGH',
         _playCount: parseInt(song.play_count) || parseInt(song.playCount) || 0,
-        // keep raw payload if needed
         _raw: song,
-        isrc: song.isrc || (song.identifiers && song.identifiers.isrc) || null
+        isrc: song.isrc || (song.more_info && song.more_info.isrc) || (song.identifiers && song.identifiers.isrc) || null
     };
     if (result.isrc) {
         try { _ISRC_INDEX.set(String(result.isrc).toUpperCase(), result.id); } catch (e) {}
@@ -497,55 +557,47 @@ function mapTrack(song) {
 
 async function searchTracks(query, limit = 20, context) {
     try {
-        const useDirect = true; // Forcing direct search
         const intent = queryIntent(query);
         const versionRequested = intent.wantsLive || intent.wantsRemix || intent.wantsAcoustic || intent.wantsDemo || intent.wantsInstrumental || intent.wantsCover || intent.wantsSlowed || intent.wantsSpedUp || intent.wantsNightcore || intent.wantsReverb || intent.wants8D || intent.wantsBassBoost || intent.wantsExtended;
-        
-        let tracks = [];
+        let tracks = await fetchDirectSearchCandidates(candidateSearchQueries(query, '', ''), Math.max(limit, 20));
 
-        if (useDirect) {
-            const directCandidates = await fetchDirectSearchCandidates(candidateSearchQueries(query, '', ''), Math.max(limit, 20));
-            tracks = directCandidates.map(t => {
-                t._relevance = queryRelevance(query, t.title, t.artist, t.album);
-                t._canon = canonicityScore(t.title);
-                t._versionType = trackVersionType(t.title);
-                t._isVersion = !!t._versionType;
-                t._popularity = Math.min(Math.log10(Math.max(1, t._playCount || 0)) / 9, 1.0);
-                return t;
-            });
-        } else {
+        if (!tracks.length) {
             const response = await fetch(`${API_BASE}/result/?query=${encodeURIComponent(query)}&limit=${limit}`, { headers: REQUEST_HEADERS });
-            if (!response.ok) return { tracks: [], total: 0 };
-            const json = await response.json();
+            if (response.ok) {
+                const json = await response.json();
+                let rawResults = [];
+                if (Array.isArray(json)) {
+                    rawResults = json;
+                } else if (json.success && json.data) {
+                    rawResults = json.data.results || json.data.songs || json.data || [];
+                } else {
+                    rawResults = json.songs || json.results || [];
+                }
 
-            let rawResults = [];
-            if (Array.isArray(json)) {
-                rawResults = json;
-            } else if (json.success && json.data) {
-                rawResults = json.data.results || json.data.songs || json.data || [];
-            } else {
-                rawResults = json.songs || json.results || [];
+                if (Array.isArray(rawResults) && rawResults.length > 0) {
+                    tracks = rawResults.map((song, index) => {
+                        const mapped = mapTrack(song);
+                        mapped._sourceRank = index;
+                        return mapped;
+                    });
+                }
             }
-
-            if (!Array.isArray(rawResults) || rawResults.length === 0) return { tracks: [], total: 0 };
-
-            tracks = rawResults.map((song, index) => {
-                const mapped = mapTrack(song);
-                mapped._sourceRank = index;
-                mapped._relevance = queryRelevance(query, mapped.title, mapped.artist, mapped.album);
-                mapped._canon = canonicityScore(mapped.title);
-                mapped._versionType = trackVersionType(mapped.title);
-                mapped._isVersion = !!mapped._versionType;
-                mapped._popularity = Math.min(Math.log10(Math.max(1, mapped._playCount)) / 9, 1.0);
-                return mapped;
-            });
         }
 
-        // Apply Jimmy scoring and dedupe by default
-        for (const t of tracks) {
+        if (!Array.isArray(tracks) || tracks.length === 0) return { tracks: [], total: 0 };
+
+        tracks = dedupeTrackCandidates(tracks).map(function (t, index) {
+            t._sourceRank = typeof t._sourceRank === 'number' ? t._sourceRank : index;
+            t._relevance = queryRelevance(query, t.title, t.artist, t.album);
+            t._canon = canonicityScore(t.title);
+            t._versionType = trackVersionType(t.title);
+            t._isVersion = !!t._versionType;
+            t._popularity = Math.min(Math.log10(Math.max(1, t._playCount || 0)) / 9, 1.0);
+            t._searchScore = scoreSearchCandidate(t, query);
             t._versionPenalty = t._isVersion && !versionRequested ? 0.95 : 0;
-            t._jimmyScore = (t._canon * 0.55) + (t._relevance * 0.40) + (t._popularity * 0.05) - t._versionPenalty;
-        }
+            t._jimmyScore = (t._searchScore * 0.90) + (t._popularity * 0.05) - t._versionPenalty;
+            return t;
+        });
 
         const dedupMap = new Map();
         for (const t of tracks) {
@@ -605,7 +657,7 @@ async function getTrackStreamUrl(trackId, preferredQuality, context) {
         
         try {
             const queries = candidateSearchQueries(lookupTitle, lookupArtist, lookupAlbum);
-            const candidates = await fetchDirectSearchCandidates(queries, 20);
+            const candidates = dedupeTrackCandidates(await fetchDirectSearchCandidates(queries, 20));
 
             if (candidates.length) {
                 let chosen = null;
@@ -627,13 +679,19 @@ async function getTrackStreamUrl(trackId, preferredQuality, context) {
                 if (!chosen) {
                     const titleFiltered = lookupTitle ? candidates.filter(c => titleMatchScore(c.title, lookupTitle) >= 0.70) : candidates;
                     const scored = titleFiltered.length ? titleFiltered : candidates;
-                    chosen = bestTrackFromCandidates(scored, lookupTitle, lookupArtist, lookupQuery);
+                    chosen = bestTrackFromCandidates(scored, { title: lookupTitle, artist: lookupArtist, album: lookupAlbum }, lookupQuery);
                 }
 
-                if (chosen && lookupTitle && titleMatchScore(chosen.title, lookupTitle) < 0.70) {
+                const chosenScore = chosen ? scorePlaybackCandidate(chosen, { title: lookupTitle, artist: lookupArtist, album: lookupAlbum }, queryIntent(lookupQuery)) : -1;
+
+                if (chosen && chosenScore < 0.78) {
+                    throw new Error('No confident catalog match found for stream resolution');
+                }
+
+                if (chosen && lookupTitle && titleMatchScore(chosen.title, lookupTitle) < 0.78) {
                      throw new Error('No confident title match found for stream resolution');
                 }
-                if (chosen && lookupArtist && similarity(chosen.artist, lookupArtist) < 0.60) {
+                if (chosen && lookupArtist && artistSimilarityScore(chosen.artist, lookupArtist) < 0.68) {
                     throw new Error('No confident artist match found for stream resolution');
                 }
 
