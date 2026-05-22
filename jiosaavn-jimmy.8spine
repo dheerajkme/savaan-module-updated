@@ -552,7 +552,10 @@ function mapTrack(song) {
 
     const title = htmlDecode(song.song || song.name || song.title || 'Unknown Title');
     const albumName = htmlDecode((song.album && song.album.name) ? song.album.name : (typeof song.album === 'string' ? song.album : 'Unknown Album'));
-    const trackId = String(song.id || song.songid || song.vcode || song.perma_url || '');
+    const trackId = String(song.id || song.songid || song.vcode || song.perma_url || '') +
+        '||' + encodeURIComponent(song.perma_url || '') +
+        '||' + encodeURIComponent(title) +
+        '||' + encodeURIComponent(artistName);
 
     const result = {
         id: trackId,
